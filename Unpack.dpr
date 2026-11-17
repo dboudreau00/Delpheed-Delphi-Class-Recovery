@@ -2,6 +2,11 @@ program Unpack;
 
 {$APPTYPE CONSOLE}
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   Usage:  Unpack <packed.exe> [output.exe]
 
@@ -31,11 +36,7 @@ begin
   else
     outPath := ChangeFileExt(ParamStr(1), '') + '_dump.exe';
 
-  u := TGenericUnpacker.Create(
-    procedure(const m: string)
-    begin
-      CONote(m);
-    end);
+  u := TGenericUnpacker.Create(COLogger.Note);
   try
     r := u.Unpack(ParamStr(1), outPath);
   finally

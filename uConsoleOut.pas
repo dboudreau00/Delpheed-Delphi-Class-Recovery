@@ -1,5 +1,10 @@
 unit uConsoleOut;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uConsoleOut - one accessible output surface for all the command-line tools.
 
@@ -29,7 +34,14 @@ const
   EXIT_INPUT      = 2;   // input could not be read / was not valid
   EXIT_PROCESSING = 3;   // ran, but the operation failed
 
+type
+  TConsoleLogger = class
+  public
+    procedure Note(const Msg: string);
+  end;
+
 procedure COSetQuiet(Quiet: Boolean);
+function COLogger: TConsoleLogger;
 
 procedure COSection(const Title: string);           // "== Title =="
 procedure COField(const Name, Value: string);       // "Name: Value"
@@ -44,6 +56,19 @@ implementation
 
 var
   GQuiet: Boolean = False;
+  GLogger: TConsoleLogger = nil;
+
+procedure TConsoleLogger.Note(const Msg: string);
+begin
+  CONote(Msg);
+end;
+
+function COLogger: TConsoleLogger;
+begin
+  if GLogger = nil then
+    GLogger := TConsoleLogger.Create;
+  Result := GLogger;
+end;
 
 procedure COSetQuiet(Quiet: Boolean);
 begin
@@ -96,5 +121,9 @@ begin
   if Desc <> '' then
     Writeln(Desc);
 end;
+
+finalization
+  GLogger.Free;
+  GLogger := nil;
 
 end.

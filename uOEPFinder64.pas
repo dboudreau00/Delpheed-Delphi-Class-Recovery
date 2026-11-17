@@ -1,72 +1,68 @@
-unit uOEPFinder;
+unit uOEPFinder64;
+
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
 
 {
-  uOEPFinder - find the Original Entry Point of a packed 32-bit PE by page
-  permissions instead of the ESP trick, so it works on stubs that do NOT begin
-  with PUSHAD.
+  uOEPFinder64 - 64-bit (PE32+) guard-page OEP finder. The x64 counterpart of
+  uOEPFinder.
 
-  Idea
-  ----
-  A stub decompresses the real code into memory, then jumps to the OEP. If we
-  remove EXECUTE permission from every section except the stub's own, the stub
-  can still READ and WRITE those pages while unpacking (no fault), but the very
-  first attempt to EXECUTE in one of them - the jump to OEP - trips DEP and
-  raises an access violation whose faulting address is the OEP. Exactly one
-  fault, no single-stepping.
+  The method is identical in spirit: strip execute from every non-stub section,
+  let the stub decompress into those (readable/writable) pages without faulting,
+  and catch the execute fault the instant control transfers into unpacked code -
+  its address is the OEP. DEP is always enforced for x64 processes, so this is
+  even more reliable here than on x86.
 
-    1. Launch the target under the debugger, break at the stub entry.
-    2. Set every non-stub section to PAGE_READWRITE (executable bit cleared).
-    3. Run at full speed.
-    4. Catch EXCEPTION_ACCESS_VIOLATION with access type = execute (8); if the
-       faulting address is inside the image and outside the stub section, that
-       address is the OEP.
-    5. Optionally dump the now-unpacked image (same layout fix-up as uUnpacker).
+  What changes from the 32-bit version:
+    * PE32+ headers: magic $20B, machine $8664 (AMD64).
+    * 64-bit CONTEXT: Rip instead of Eip, the x64 CONTEXT flag set.
+    * 8-byte image base, patched into the dump at optional-header +24.
+  The ESP trick does NOT port (no PUSHAD/POPAD in x64); this guard-page method
+  is the x64 unpacker.
 
-  Requires DEP to be enforced for the target - the default for 32-bit processes
-  on 64-bit Windows. Build and run this 32-bit.
-
-  Complements uUnpacker (the ESP trick): use that when the stub starts with
-  PUSHAD, use this when it does not.
-
-  Limits: a stub that calls VirtualProtect to re-grant execute on the OEP
-  section before jumping will not fault (no detection); code unpacked into a
-  fresh VirtualAlloc region rather than back into the image runs outside the
-  image and is not what gets dumped; and a stub whose helper code runs in a
-  second section will fault there first (add it via ExtraStubSections).
-
-  WARNING: this executes the target's stub. Untrusted samples in a VM only.
+  Build 64-bit (dcc64/ppcx64) so it debugs 64-bit targets with the native CONTEXT.
+  Runs the target's stub - untrusted samples in a VM only.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
-{$IF Defined(WIN64)}
-  {$MESSAGE WARN 'Compile this 32-bit (dcc32) to analyse 32-bit targets.'}
+{$IF Defined(WIN32)}
+  {$MESSAGE WARN 'Compile this 64-bit (dcc64/ppcx64) to analyse 64-bit targets.'}
 {$IFEND}
 
 interface
 
 uses
-  Windows, SysUtils, Classes, uAntiAntiDebug, uIATRebuild;
+  Windows, SysUtils, Classes, Generics.Collections;
 
 type
-  TOEPLog = reference to procedure(const Msg: string);
+  {$IFDEF FPC}
+  TOEP64Log = procedure(const Msg: string) of object;
+  {$ELSE}
+  TOEP64Log = reference to procedure(const Msg: string);
+  {$ENDIF}
 
-  TOEPResult = record
+  TOEP64Result = record
     Success: Boolean;
     Message: string;
-    ImageBase: NativeUInt;
+    ImageBase: UInt64;
     OEPRVA: Cardinal;
-    OEPVA: NativeUInt;
-    DumpFile: string;         // '' when no dump was requested
+    OEPVA: UInt64;
+    DumpFile: string;
+    FixedFile: string;
   end;
 
-  TOEPFinder = class
+  TOEPFinder64 = class
   private
-    FLog: TOEPLog;
+    FLog: TOEP64Log;
     FProc: THandle;
     FThread: THandle;
-    FBase: NativeUInt;
-    FEntry: NativeUInt;
+    FBase: UInt64;
+    FEntry: UInt64;
     FSizeOfImage: Cardinal;
     FSizeOfHeaders: Cardinal;
     FLfanew: Cardinal;
@@ -79,31 +75,33 @@ type
     FStubSec: Integer;
     FExtraStub: TArray<Integer>;
     FOrigEntryByte: Byte;
-    FOEP: NativeUInt;
+    FOEP: UInt64;
     procedure Log(const S: string);
-    function ReadMem(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
-    function WriteMem(Addr: NativeUInt; const Buf; Size: NativeUInt): Boolean;
-    function RByte(Addr: NativeUInt): Byte;
-    procedure WByte(Addr: NativeUInt; B: Byte);
-    function GetCtx(var Ctx: TContext): Boolean;
-    function SetCtx(var Ctx: TContext): Boolean;
+    procedure LogAAD(const S: string);
+    procedure LogIAT(const S: string);
+    function ReadMem(Addr: UInt64; var Buf; Size: NativeUInt): Boolean;
+    function WriteMem(Addr: UInt64; const Buf; Size: NativeUInt): Boolean;
+    function RByte(Addr: UInt64): Byte;
+    procedure WByte(Addr: UInt64; B: Byte);
+    function GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+    function SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
     function ParseHeaders: Boolean;
     function SectionOfRVA(RVA: Cardinal): Integer;
     function IsStubSection(Idx: Integer): Boolean;
     procedure StripExecuteFromNonStub;
     function DumpTo(const OutFile: string): Boolean;
   public
-    // Set these before calling Find:
-    AntiAntiDebug: Boolean;   // patch PEB / hook ntdll to hide the debugger
-    RebuildImports: Boolean;  // after dumping, reconstruct the import table
-    constructor Create(ALog: TOEPLog = nil);
-    // ExtraStubSections: indices of any additional sections the stub executes
-    // from (kept executable). Usually leave empty.
+    AntiAntiDebug: Boolean;
+    RebuildImports: Boolean;
+    constructor Create(ALog: TOEP64Log = nil);
     procedure SetExtraStubSections(const Indices: array of Integer);
-    function Find(const TargetExe: string; const DumpFile: string = ''): TOEPResult;
+    function Find(const TargetExe: string; const DumpFile: string = ''): TOEP64Result;
   end;
 
 implementation
+
+uses
+  uAntiAntiDebug64, uIATRebuild64;
 
 function K32Read(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   nSize: NativeUInt; lpRead: PNativeUInt): BOOL; stdcall;
@@ -117,7 +115,9 @@ function K32Protect(hProcess: THandle; lpAddress: Pointer; dwSize: NativeUInt;
 
 const
   DE_EXCEPTION      = 1;
+  DE_CREATE_THREAD  = 2;
   DE_CREATE_PROCESS = 3;
+  DE_EXIT_THREAD    = 4;
   DE_EXIT_PROCESS   = 5;
   DE_LOAD_DLL       = 6;
 
@@ -129,22 +129,21 @@ const
   CONT_NOT_HANDLED: DWORD = $80010001;
 
   F_DEBUG_ONLY_THIS = $00000002;
-  CTX_ALL           = $00010017;   // CONTROL | INTEGER | SEGMENTS | DEBUG
+  CTX_ALL           = $00100013;   // AMD64 | CONTROL | INTEGER | DEBUG_REGISTERS
   TRAP_FLAG         = $00000100;
 
-  ACCESS_EXECUTE = 8;              // ExceptionInformation[0] value for a DEP fault
+  ACCESS_EXECUTE = 8;
   PAGE_SIZE      = $1000;
-  SCN_EXECUTE    = $20000000;
 
   MAX_EVENTS = 200000;
 
-constructor TOEPFinder.Create(ALog: TOEPLog);
+constructor TOEPFinder64.Create(ALog: TOEP64Log);
 begin
   inherited Create;
   FLog := ALog;
 end;
 
-procedure TOEPFinder.SetExtraStubSections(const Indices: array of Integer);
+procedure TOEPFinder64.SetExtraStubSections(const Indices: array of Integer);
 var
   i: Integer;
 begin
@@ -153,12 +152,22 @@ begin
     FExtraStub[i] := Indices[i];
 end;
 
-procedure TOEPFinder.Log(const S: string);
+procedure TOEPFinder64.Log(const S: string);
 begin
   if Assigned(FLog) then FLog(S);
 end;
 
-function TOEPFinder.ReadMem(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
+procedure TOEPFinder64.LogAAD(const S: string);
+begin
+  Log('AAD: ' + S);
+end;
+
+procedure TOEPFinder64.LogIAT(const S: string);
+begin
+  Log('IAT: ' + S);
+end;
+
+function TOEPFinder64.ReadMem(Addr: UInt64; var Buf; Size: NativeUInt): Boolean;
 var
   got: NativeUInt;
 begin
@@ -166,7 +175,7 @@ begin
   Result := K32Read(FProc, Pointer(Addr), @Buf, Size, @got) and (got = Size);
 end;
 
-function TOEPFinder.WriteMem(Addr: NativeUInt; const Buf; Size: NativeUInt): Boolean;
+function TOEPFinder64.WriteMem(Addr: UInt64; const Buf; Size: NativeUInt): Boolean;
 var
   put: NativeUInt;
 begin
@@ -174,7 +183,7 @@ begin
   Result := K32Write(FProc, Pointer(Addr), @Buf, Size, @put) and (put = Size);
 end;
 
-function TOEPFinder.RByte(Addr: NativeUInt): Byte;
+function TOEPFinder64.RByte(Addr: UInt64): Byte;
 var
   b: Byte;
 begin
@@ -183,28 +192,42 @@ begin
   Result := b;
 end;
 
-procedure TOEPFinder.WByte(Addr: NativeUInt; B: Byte);
+procedure TOEPFinder64.WByte(Addr: UInt64; B: Byte);
 begin
   WriteMem(Addr, B, 1);
 end;
 
-function TOEPFinder.GetCtx(var Ctx: TContext): Boolean;
+function TOEPFinder64.GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  FillChar(Ctx, SizeOf(Ctx), 0);
-  Ctx.ContextFlags := CTX_ALL;
-  Result := GetThreadContext(FThread, Ctx);
+  FillChar(buf, SizeOf(buf), 0);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := GetThreadContext(hThr, pCtx^);
+  if Result then
+    Ctx := pCtx^
+  else
+    FillChar(Ctx, SizeOf(Ctx), 0);
 end;
 
-function TOEPFinder.SetCtx(var Ctx: TContext): Boolean;
+function TOEPFinder64.SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  Ctx.ContextFlags := CTX_ALL;
-  Result := SetThreadContext(FThread, Ctx);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^ := Ctx;
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := SetThreadContext(hThr, pCtx^);
 end;
 
-function TOEPFinder.ParseHeaders: Boolean;
+function TOEPFinder64.ParseHeaders: Boolean;
 var
   hdr: TBytes;
-  need, i: Integer;
+  need: UInt64;
+  i: Integer;
   machine, magic, numSecs, sizeOpt: Word;
 begin
   Result := False;
@@ -213,7 +236,8 @@ begin
 
   if PWord(@hdr[0])^ <> $5A4D then Exit;
   FLfanew := PCardinal(@hdr[$3C])^;
-  if FLfanew + 256 > Cardinal(Length(hdr)) then
+  if FLfanew > $10000 then Exit;
+  if UInt64(FLfanew) + 256 > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, FLfanew + 1024);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
@@ -221,20 +245,23 @@ begin
   if PCardinal(@hdr[FLfanew])^ <> $00004550 then Exit;
 
   machine := PWord(@hdr[FLfanew + 4])^;
-  if machine <> $014C then Exit;
+  if machine <> $8664 then Exit;                          // AMD64 only
   FOptOfs := FLfanew + 24;
   magic := PWord(@hdr[FOptOfs])^;
-  if magic <> $10B then Exit;
+  if magic <> $20B then Exit;                             // PE32+ only
 
   FSizeOfImage   := PCardinal(@hdr[FOptOfs + 56])^;
   FSizeOfHeaders := PCardinal(@hdr[FOptOfs + 60])^;
+  if (FSizeOfImage = 0) or (FSizeOfImage > $40000000) then Exit;
   numSecs        := PWord(@hdr[FLfanew + 6])^;
   sizeOpt        := PWord(@hdr[FLfanew + 20])^;
+  if numSecs > 96 then Exit;
   FSecTab        := FOptOfs + sizeOpt;
   FNumSecs       := numSecs;
 
-  need := Integer(FSecTab) + numSecs * 40;
-  if need > Length(hdr) then
+  need := UInt64(FSecTab) + UInt64(numSecs) * 40;
+  if need > $100000 then Exit;
+  if need > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, need + 64);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
@@ -252,7 +279,7 @@ begin
   Result := True;
 end;
 
-function TOEPFinder.SectionOfRVA(RVA: Cardinal): Integer;
+function TOEPFinder64.SectionOfRVA(RVA: Cardinal): Integer;
 var
   i: Integer;
   vs: Cardinal;
@@ -262,13 +289,13 @@ begin
   begin
     vs := FSecVSize[i];
     if vs = 0 then vs := 1;
-    if (RVA >= FSecVA[i]) and (RVA < FSecVA[i] + vs) then Exit(i);
+    if (RVA >= FSecVA[i]) and (UInt64(RVA) < UInt64(FSecVA[i]) + UInt64(vs)) then Exit(i);
   end;
   for i := FNumSecs - 1 downto 0 do
     if RVA >= FSecVA[i] then Exit(i);
 end;
 
-function TOEPFinder.IsStubSection(Idx: Integer): Boolean;
+function TOEPFinder64.IsStubSection(Idx: Integer): Boolean;
 var
   i: Integer;
 begin
@@ -278,10 +305,10 @@ begin
     if FExtraStub[i] = Idx then Exit(True);
 end;
 
-procedure TOEPFinder.StripExecuteFromNonStub;
+procedure TOEPFinder64.StripExecuteFromNonStub;
 var
   i: Integer;
-  addr: NativeUInt;
+  addr: UInt64;
   size, old: DWORD;
 begin
   for i := 0 to FNumSecs - 1 do
@@ -290,16 +317,15 @@ begin
     addr := FBase + FSecVA[i];
     size := FSecVSize[i];
     if size = 0 then size := PAGE_SIZE;
-    size := (size + PAGE_SIZE - 1) and not (PAGE_SIZE - 1);   // round up to page
+    size := (size + PAGE_SIZE - 1) and not (PAGE_SIZE - 1);
     old := 0;
-    // read+write but NOT execute -> unpacking writes are fine, execution faults
     if not K32Protect(FProc, Pointer(addr), size, PAGE_READWRITE, @old) then
       Log(Format('VirtualProtectEx failed on section %d (err %d)', [i, GetLastError]));
   end;
   Log('Execute permission stripped from non-stub sections.');
 end;
 
-function TOEPFinder.DumpTo(const OutFile: string): Boolean;
+function TOEPFinder64.DumpTo(const OutFile: string): Boolean;
 var
   buf: TBytes;
   off, chunk, got, total: NativeUInt;
@@ -309,7 +335,15 @@ var
 begin
   Result := False;
   if FSizeOfImage = 0 then Exit;
-  SetLength(buf, FSizeOfImage);
+  try
+    SetLength(buf, FSizeOfImage);
+  except
+    on E: Exception do
+    begin
+      Log('Dump allocation failed: ' + E.Message);
+      Exit;
+    end;
+  end;
 
   off := 0; total := 0;
   while off < FSizeOfImage do
@@ -324,7 +358,7 @@ begin
   if total = 0 then
     Log('Warning: no image memory could be read; dump will be empty.');
 
-  PCardinal(@buf[FOptOfs + 28])^ := Cardinal(FBase);
+  PUInt64(@buf[FOptOfs + 24])^ := FBase;
   PCardinal(@buf[FOptOfs + 16])^ := Cardinal(FOEP - FBase);
   PCardinal(@buf[FOptOfs + 36])^ := PCardinal(@buf[FOptOfs + 32])^;
 
@@ -335,6 +369,9 @@ begin
     if nextVA > thisVA then rawSize := nextVA - thisVA else rawSize := FSecVSize[i];
     PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 16])^ := rawSize;
     PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 20])^ := thisVA;
+    if ((FSecChar[i] and $00000080) <> 0) or ((FSecChar[i] and $20000000) <> 0) then
+      PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 36])^ :=
+        (FSecChar[i] and not Cardinal($00000080)) or $C0000040;
   end;
 
   try
@@ -351,7 +388,7 @@ begin
   end;
 end;
 
-function TOEPFinder.Find(const TargetExe, DumpFile: string): TOEPResult;
+function TOEPFinder64.Find(const TargetExe, DumpFile: string): TOEP64Result;
 type
   TState = (stEntry, stRun, stDone);
 var
@@ -362,12 +399,18 @@ var
   state: TState;
   running: Boolean;
   contFlag, code: DWORD;
-  addr, faultAddr: NativeUInt;
-  access: NativeUInt;
-  rva: Cardinal;
+  addr, faultAddr, access: UInt64;
+  rva, stubStart, stubEnd: Cardinal;
   sec, events: Integer;
+  aad: TAntiAntiDebug64;
+  threads: TDictionary<DWORD, THandle>;
+  hCurThread: THandle;
+  fixed: string;
+  rb: TIATRebuilder64;
+  rbRes: TIAT64Result;
+  kv: TPair<DWORD, THandle>;
 begin
-  Result := Default(TOEPResult);
+  Result := Default(TOEP64Result);
   FillChar(si, SizeOf(si), 0);
   si.cb := SizeOf(si);
   FillChar(pi, SizeOf(pi), 0);
@@ -381,6 +424,9 @@ begin
 
   FProc := pi.hProcess;
   FThread := pi.hThread;
+  aad := nil;
+  threads := TDictionary<DWORD, THandle>.Create;
+  threads.Add(pi.dwThreadId, pi.hThread);
   state := stEntry;
   running := True;
   events := 0;
@@ -406,14 +452,14 @@ begin
       case de.dwDebugEventCode of
         DE_CREATE_PROCESS:
           begin
-            FBase  := NativeUInt(de.CreateProcessInfo.lpBaseOfImage);
-            FEntry := NativeUInt(de.CreateProcessInfo.lpStartAddress);
+            FBase  := UInt64(de.CreateProcessInfo.lpBaseOfImage);
+            FEntry := UInt64(de.CreateProcessInfo.lpStartAddress);
             if de.CreateProcessInfo.hFile <> 0 then
               CloseHandle(de.CreateProcessInfo.hFile);
 
             if not ParseHeaders then
             begin
-              Result.Message := 'Not a 32-bit PE32 image, or headers unreadable.';
+              Result.Message := 'Not a 64-bit PE32+ image, or headers unreadable.';
               running := False;
             end
             else
@@ -431,15 +477,22 @@ begin
                 [FBase, FEntry, FSizeOfImage, FNumSecs, FStubSec]));
               if AntiAntiDebug then
               begin
-                var aad := TAntiAntiDebug.Create(FProc,
-                  procedure(const m: string) begin Log('AAD: ' + m); end);
-                try
-                  aad.Apply;
-                finally
-                  aad.Free;
-                end;
+                aad := TAntiAntiDebug64.Create(FProc, LogAAD);
+                aad.Apply;
               end;
             end;
+          end;
+
+        DE_CREATE_THREAD:
+          if (de.CreateThread.hThread <> 0) and (not threads.ContainsKey(de.dwThreadId)) then
+            threads.Add(de.dwThreadId, de.CreateThread.hThread);
+
+        DE_EXIT_THREAD:
+          if threads.TryGetValue(de.dwThreadId, hCurThread) then
+          begin
+            if hCurThread <> pi.hThread then
+              CloseHandle(hCurThread);
+            threads.Remove(de.dwThreadId);
           end;
 
         DE_LOAD_DLL:
@@ -449,34 +502,37 @@ begin
         DE_EXIT_PROCESS:
           begin
             if Result.Message = '' then
-              Result.Message :=
-                'Target exited before an OEP fault. DEP may be disabled, or the ' +
-                'stub re-granted execute / unpacked outside the image.';
+              Result.Message := 'Target exited before an OEP fault (stub re-granted execute, ' +
+                'or unpacked outside the image).';
             running := False;
           end;
 
         DE_EXCEPTION:
           begin
             code := de.Exception.ExceptionRecord.ExceptionCode;
-            addr := NativeUInt(de.Exception.ExceptionRecord.ExceptionAddress);
+            addr := UInt64(de.Exception.ExceptionRecord.ExceptionAddress);
+            if not threads.TryGetValue(de.dwThreadId, hCurThread) then
+              hCurThread := FThread;
 
             case state of
               stEntry:
                 if (code = ST_BREAKPOINT) and (addr = FEntry) then
                 begin
-                  if GetCtx(ctx) then
+                  if aad <> nil then
+                    aad.PatchPEB(False);
+                  if GetCtx(hCurThread, ctx) then
                   begin
-                    WByte(FEntry, FOrigEntryByte);   // restore real instruction
+                    WByte(FEntry, FOrigEntryByte);
                     FlushInstructionCache(FProc, Pointer(FEntry), 1);
-                    ctx.Eip := FEntry;               // rewind over the INT3
-                    ctx.EFlags := ctx.EFlags and not TRAP_FLAG;   // run full speed
-                    SetCtx(ctx);
+                    ctx.Rip := FEntry;
+                    ctx.EFlags := ctx.EFlags and not TRAP_FLAG;
+                    SetCtx(hCurThread, ctx);
                     StripExecuteFromNonStub;
                     state := stRun;
                   end;
                 end
                 else if code = ST_BREAKPOINT then
-                  contFlag := CONT_CONTINUE            // loader / system breakpoint
+                  contFlag := CONT_CONTINUE
                 else
                   contFlag := CONT_NOT_HANDLED;
 
@@ -491,7 +547,7 @@ begin
                     faultAddr := de.Exception.ExceptionRecord.ExceptionInformation[1];
                   end;
 
-                  if (access = ACCESS_EXECUTE) and
+                  if ((access = ACCESS_EXECUTE) or ((access = 0) and (addr = faultAddr))) and
                      (faultAddr >= FBase) and (faultAddr < FBase + FSizeOfImage) then
                   begin
                     rva := Cardinal(faultAddr - FBase);
@@ -501,19 +557,19 @@ begin
                       FOEP := faultAddr;
                       Log(Format('OEP at $%x (RVA $%x, section %d)', [FOEP, rva, sec]));
                       state := stDone;
-                      running := False;               // freeze here, do not resume
+                      running := False;
                     end
                     else
-                      contFlag := CONT_NOT_HANDLED;    // execute fault inside stub: pass
+                      contFlag := CONT_NOT_HANDLED;
                   end
                   else
-                    contFlag := CONT_NOT_HANDLED;      // read/write fault or outside image
+                    contFlag := CONT_NOT_HANDLED;
                 end
                 else
                   contFlag := CONT_NOT_HANDLED;
-            end; // case state
+            end;
           end;
-      end; // case event
+      end;
 
       if (not running) and (state = stDone) then
       begin
@@ -530,12 +586,29 @@ begin
             Result.Message  := 'OEP located and image dumped.';
             if RebuildImports then
             begin
-              var fixed := ChangeFileExt(DumpFile, '') + '_fixed.exe';
-              var rb := TIATRebuilder.Create(FProc,
-                procedure(const m: string) begin Log('IAT: ' + m); end);
+              stubStart := 0; stubEnd := 0;
+              if (FStubSec >= 0) and (FStubSec < FNumSecs) then
+              begin
+                stubStart := FSecVA[FStubSec];
+                if FStubSec < FNumSecs - 1 then
+                  stubEnd := FSecVA[FStubSec + 1]
+                else
+                  stubEnd := FSizeOfImage;
+              end;
+              fixed := ChangeFileExt(DumpFile, '') + '_fixed.exe';
+              rb := TIATRebuilder64.Create(FProc, LogIAT);
               try
-                if rb.RebuildImports(DumpFile, fixed).Success then
+                rbRes := rb.RebuildImports(DumpFile, fixed, stubStart, stubEnd);
+                if rbRes.Success then
+                begin
+                  Result.FixedFile := fixed;
                   Result.Message := Result.Message + ' Imports rebuilt: ' + fixed;
+                end
+                else
+                begin
+                  Log('IAT: ' + rbRes.Message);
+                  Result.Message := Result.Message + ' Import rebuild skipped (' + rbRes.Message + ').';
+                end;
               finally
                 rb.Free;
               end;
@@ -544,14 +617,19 @@ begin
           else
             Result.Message := 'OEP located, but dump failed.';
         end;
-        Break;                                       // do not resume the payload
+        Break;
       end;
 
       ContinueDebugEvent(de.dwProcessId, de.dwThreadId, contFlag);
-    end; // while
+    end;
   finally
     if FProc <> 0 then
       TerminateProcess(FProc, 0);
+    for kv in threads do
+      if kv.Value <> pi.hThread then
+        CloseHandle(kv.Value);
+    threads.Free;
+    aad.Free;
     if pi.hThread <> 0 then CloseHandle(pi.hThread);
     if pi.hProcess <> 0 then CloseHandle(pi.hProcess);
   end;

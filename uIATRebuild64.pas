@@ -1,50 +1,43 @@
-unit uIATRebuild;
+unit uIATRebuild64;
+
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
 
 {
-  uIATRebuild - reconstruct the import table of an unpacked dump so it loads again.
+  uIATRebuild64 - 64-bit (PE32+) import-table reconstruction. The x64 counterpart
+  of uIATRebuild.
 
-  After unpacking, the stub has resolved every API the program needs and written
-  the addresses into the Import Address Table in memory. But the on-disk import
-  *directory* (the descriptors the loader reads) is gone. This rebuilds it, the
-  way Scylla/ImpREC do:
+  Same algorithm - enumerate modules, find the resolved IAT as the longest run of
+  pointers into loaded DLLs, resolve each against the DLL's export table, and emit
+  a fresh import directory into an appended section - with the x64 differences:
+    * PE32+ headers: 8-byte image base at optional-header +24, data directories
+      at +112.
+    * IAT / ILT thunks are 8 bytes; the import-by-ordinal flag is bit 63.
+  Import descriptors stay 20 bytes (their fields are 32-bit RVAs in both formats).
 
-    1. Enumerate the loaded modules of the live target (base, size, name).
-    2. Scan the dumped image for the IAT: the longest run of pointer slots that
-       all point into a loaded DLL (self-pointers into the image are ignored).
-    3. Resolve each pointer to (DLL, function) by reading that DLL's export
-       table out of the live process.
-    4. Group the resolved pointers by DLL (contiguous runs) and emit a new
-       import directory - descriptors + import lookup tables + hint/name tables
-       + DLL name strings - into a fresh section appended to the file, with the
-       FirstThunk of each descriptor pointing back at the existing IAT slots.
-    5. Point the PE's import data directory at the new descriptors.
-
-  MUST be called while the target is still alive and frozen at the OEP (its DLLs
-  loaded, its IAT resolved). That means calling it from inside the OEP finder,
-  before it terminates the process - see the integration note shipped with this.
-
-  32-bit (PE32) targets. Build 32-bit.
-
-  Honest limits: entries the packer resolved by GetProcAddress land on exact
-  export addresses and resolve cleanly; forwarded exports resolve because we
-  match the final address in the destination DLL; anything that doesn't match an
-  export (hooked/redirected thunks) is counted as unresolved and left as a raw
-  pointer, which only works at runtime if that DLL loads at the same base. The
-  IAT search is heuristic (longest module-pointer run); a disassembly-from-OEP
-  search would be more precise but needs a disassembler.
+  Must be called while the target is alive at the OEP. Build 64-bit.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 interface
 
 uses
-  Windows, SysUtils, Classes, Generics.Collections, TlHelp32;
+  Windows, SysUtils, Classes, Generics.Collections,
+  {$IFDEF FPC}JwaTlHelp32{$ELSE}TlHelp32{$ENDIF};
 
 type
-  TIATLog = reference to procedure(const Msg: string);
+  {$IFDEF FPC}
+  TIAT64Log = procedure(const Msg: string) of object;
+  {$ELSE}
+  TIAT64Log = reference to procedure(const Msg: string);
+  {$ENDIF}
 
-  TIATResult = record
+  TIAT64Result = record
     Success: Boolean;
     Message: string;
     IATStartRVA: Cardinal;
@@ -55,24 +48,24 @@ type
     OutFile: string;
   end;
 
-  TImp = record
+  TImp64 = record
     ByName: Boolean;
     Name: AnsiString;
     Ordinal: Word;
   end;
 
-  TImpGroup = record
+  TImpGroup64 = record
     ModIndex: Integer;
-    StartRVA: Cardinal;          // FirstThunk: RVA of the first IAT slot in the group
-    Entries: TArray<TImp>;
-    ILTOffset: Cardinal;         // offset of this group's ILT inside the new blob
+    StartRVA: Cardinal;
+    Entries: TArray<TImp64>;
+    ILTOffset: Cardinal;
   end;
 
-  TModExports = class
+  TModExports64 = class
   public
     Index: Integer;
-    Base: NativeUInt;
-    Size: NativeUInt;
+    Base: UInt64;
+    Size: UInt64;
     Name: string;
     IsImage: Boolean;
     Parsed: Boolean;
@@ -87,26 +80,27 @@ type
     destructor Destroy; override;
   end;
 
-  TIATRebuilder = class
+  TIATRebuilder64 = class
   private
-    FLog: TIATLog;
+    FLog: TIAT64Log;
     FProc: THandle;
-    FImageBase: NativeUInt;
+    FImageBase: UInt64;
     FSizeOfImage: Cardinal;
-    FMods: TObjectList<TModExports>;
+    FMods: TObjectList<TModExports64>;
     procedure Log(const S: string);
-    function RBytes(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
-    function RU32(Addr: NativeUInt): Cardinal;
-    function RU16(Addr: NativeUInt): Word;
-    function RCStr(Addr: NativeUInt): AnsiString;
+    function RBytes(Addr: UInt64; var Buf; Size: NativeUInt): Boolean;
+    function RU32(Addr: UInt64): Cardinal;
+    function RU16(Addr: UInt64): Word;
+    function RCStr(Addr: UInt64): AnsiString;
     procedure EnumModules;
-    procedure ParseModule(M: TModExports);
-    function ModuleOf(VA: NativeUInt): TModExports;
-    function Resolve(VA: NativeUInt; out ModIdx: Integer; out Imp: TImp): Boolean;
+    procedure ParseModule(M: TModExports64);
+    function ModuleOf(VA: UInt64): TModExports64;
+    function Resolve(VA: UInt64; out ModIdx: Integer; out Imp: TImp64): Boolean;
   public
-    constructor Create(hProcess: THandle; ALog: TIATLog = nil);
+    constructor Create(hProcess: THandle; ALog: TIAT64Log = nil);
     destructor Destroy; override;
-    function RebuildImports(const InDumpFile, OutFixedFile: string): TIATResult;
+    function RebuildImports(const InDumpFile, OutFixedFile: string;
+      StubStartRVA: Cardinal = 0; StubEndRVA: Cardinal = 0): TIAT64Result;
   end;
 
 implementation
@@ -114,55 +108,57 @@ implementation
 function K32Read(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   nSize: NativeUInt; lpRead: PNativeUInt): BOOL; stdcall;
   external kernel32 name 'ReadProcessMemory';
+function K32GetPid(hProcess: THandle): DWORD; stdcall;
+  external kernel32 name 'GetProcessId';
 
 const
-  MIN_IMPORTS = 5;
-  IMPORT_BY_ORDINAL = $80000000;
-  DDIR_IMPORT = 1;
-  DDIR_BOUND  = 11;
-  DDIR_IAT    = 12;
+  MIN_IMPORTS = 3;
+  MAX_ZERO_GAP = 4;
+  IMPORT_BY_ORDINAL64: UInt64 = UInt64(1) shl 63;
+  DDIR_IMPORT    = 1;
+  DDIR_BASERELOC = 5;
+  DDIR_BOUND     = 11;
+  DDIR_IAT       = 12;
+  DLL_CHAR_DYNAMIC_BASE = $0040;
+  SNAP_MOD_FLAGS = $00000008;   // TH32CS_SNAPMODULE
 
 function Align(V, A: Cardinal): Cardinal;
 begin
   Result := (V + A - 1) and not (A - 1);
 end;
 
-{ TModExports }
-
-constructor TModExports.Create;
+constructor TModExports64.Create;
 begin
   inherited Create;
   RVAToIndex := TDictionary<Cardinal, Integer>.Create;
 end;
 
-destructor TModExports.Destroy;
+destructor TModExports64.Destroy;
 begin
   RVAToIndex.Free;
   inherited Destroy;
 end;
 
-{ TIATRebuilder }
-
-constructor TIATRebuilder.Create(hProcess: THandle; ALog: TIATLog);
+constructor TIATRebuilder64.Create(hProcess: THandle; ALog: TIAT64Log);
 begin
   inherited Create;
   FProc := hProcess;
   FLog := ALog;
-  FMods := TObjectList<TModExports>.Create(True);
+  FMods := TObjectList<TModExports64>.Create(True);
 end;
 
-destructor TIATRebuilder.Destroy;
+destructor TIATRebuilder64.Destroy;
 begin
   FMods.Free;
   inherited Destroy;
 end;
 
-procedure TIATRebuilder.Log(const S: string);
+procedure TIATRebuilder64.Log(const S: string);
 begin
   if Assigned(FLog) then FLog(S);
 end;
 
-function TIATRebuilder.RBytes(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
+function TIATRebuilder64.RBytes(Addr: UInt64; var Buf; Size: NativeUInt): Boolean;
 var
   got: NativeUInt;
 begin
@@ -170,19 +166,19 @@ begin
   Result := K32Read(FProc, Pointer(Addr), @Buf, Size, @got) and (got = Size);
 end;
 
-function TIATRebuilder.RU32(Addr: NativeUInt): Cardinal;
+function TIATRebuilder64.RU32(Addr: UInt64): Cardinal;
 begin
   Result := 0;
   RBytes(Addr, Result, 4);
 end;
 
-function TIATRebuilder.RU16(Addr: NativeUInt): Word;
+function TIATRebuilder64.RU16(Addr: UInt64): Word;
 begin
   Result := 0;
   RBytes(Addr, Result, 2);
 end;
 
-function TIATRebuilder.RCStr(Addr: NativeUInt): AnsiString;
+function TIATRebuilder64.RCStr(Addr: UInt64): AnsiString;
 var
   b: Byte;
   n: Integer;
@@ -192,31 +188,39 @@ begin
   while n < 512 do
   begin
     b := 0;
-    if not RBytes(Addr + NativeUInt(n), b, 1) then Break;
+    if not RBytes(Addr + UInt64(n), b, 1) then Break;
     if b = 0 then Break;
     Result := Result + AnsiChar(b);
     Inc(n);
   end;
 end;
 
-procedure TIATRebuilder.EnumModules;
+procedure TIATRebuilder64.EnumModules;
 var
   snap: THandle;
   me: TModuleEntry32;
-  M: TModExports;
+  M: TModExports64;
   pid: DWORD;
+  tries: Integer;
 begin
-  pid := GetProcessId(FProc);
-  snap := CreateToolhelp32Snapshot(TH32CS_SNAPMODULE or TH32CS_SNAPMODULE32, pid);
+  pid := K32GetPid(FProc);
+  snap := INVALID_HANDLE_VALUE;
+  for tries := 1 to 5 do
+  begin
+    snap := CreateToolhelp32Snapshot(SNAP_MOD_FLAGS, pid);
+    if snap <> INVALID_HANDLE_VALUE then Break;
+    if GetLastError <> ERROR_BAD_LENGTH then Break;
+    Sleep(10);
+  end;
   if snap = INVALID_HANDLE_VALUE then Exit;
   try
     FillChar(me, SizeOf(me), 0);
     me.dwSize := SizeOf(me);
     if Module32First(snap, me) then
       repeat
-        M := TModExports.Create;
+        M := TModExports64.Create;
         M.Index := FMods.Count;
-        M.Base := NativeUInt(me.modBaseAddr);
+        M.Base := UInt64(me.modBaseAddr);
         M.Size := me.modBaseSize;
         M.Name := string(me.szModule);
         M.IsImage := (M.Base = FImageBase);
@@ -228,28 +232,29 @@ begin
   Log(Format('%d modules loaded in target.', [FMods.Count]));
 end;
 
-procedure TIATRebuilder.ParseModule(M: TModExports);
+procedure TIATRebuilder64.ParseModule(M: TModExports64);
 var
-  lfanew, optOfs, ddBase: NativeUInt;
+  lfanew, optOfs, ddBase: UInt64;
   magic: Word;
   numFuncs, numNames, aof, aon, aoo, i: Cardinal;
-  nameRVA: Cardinal;
+  nameRVA, rva: Cardinal;
   ordv: Word;
   raw: TBytes;
+  prevIdx: Integer;
 begin
   M.Parsed := True;
   M.HasExports := False;
-  if RU16(M.Base) <> $5A4D then Exit;               // 'MZ'
+  if RU16(M.Base) <> $5A4D then Exit;
   lfanew := M.Base + RU32(M.Base + $3C);
-  if RU32(lfanew) <> $00004550 then Exit;           // 'PE'#0#0
+  if RU32(lfanew) <> $00004550 then Exit;
   optOfs := lfanew + 24;
   magic := RU16(optOfs);
   if magic = $20B then
     ddBase := optOfs + 112
   else
-    ddBase := optOfs + 96;                           // PE32
+    ddBase := optOfs + 96;
 
-  M.ExpDirRVA  := RU32(ddBase + DDIR_IMPORT * 0);    // export = index 0
+  M.ExpDirRVA  := RU32(ddBase);
   M.ExpDirSize := RU32(ddBase + 4);
   if M.ExpDirRVA = 0 then Exit;
 
@@ -274,18 +279,27 @@ begin
     nameRVA := RU32(M.Base + aon + i * 4);
     ordv    := RU16(M.Base + aoo + i * 2);
     if ordv < numFuncs then
-      M.NameByIndex[ordv] := RCStr(M.Base + nameRVA);
+      if M.NameByIndex[ordv] = '' then
+        M.NameByIndex[ordv] := RCStr(M.Base + nameRVA);
   end;
 
   M.RVAToIndex.Clear;
   for i := 0 to numFuncs - 1 do
-    if not M.RVAToIndex.ContainsKey(M.FuncRVAs[i]) then
-      M.RVAToIndex.Add(M.FuncRVAs[i], i);
+  begin
+    rva := M.FuncRVAs[i];
+    if rva = 0 then Continue;
+    if (M.ExpDirSize > 0) and (rva >= M.ExpDirRVA) and (rva < M.ExpDirRVA + M.ExpDirSize) then
+      Continue;
+    if not M.RVAToIndex.TryGetValue(rva, prevIdx) then
+      M.RVAToIndex.Add(rva, Integer(i))
+    else if (M.NameByIndex[prevIdx] = '') and (M.NameByIndex[i] <> '') then
+      M.RVAToIndex.AddOrSetValue(rva, Integer(i));
+  end;
 
   M.HasExports := True;
 end;
 
-function TIATRebuilder.ModuleOf(VA: NativeUInt): TModExports;
+function TIATRebuilder64.ModuleOf(VA: UInt64): TModExports64;
 var
   i: Integer;
 begin
@@ -295,9 +309,9 @@ begin
       Exit(FMods[i]);
 end;
 
-function TIATRebuilder.Resolve(VA: NativeUInt; out ModIdx: Integer; out Imp: TImp): Boolean;
+function TIATRebuilder64.Resolve(VA: UInt64; out ModIdx: Integer; out Imp: TImp64): Boolean;
 var
-  M: TModExports;
+  M: TModExports64;
   funcRVA: Cardinal;
   idx: Integer;
 begin
@@ -329,28 +343,29 @@ begin
   Result := True;
 end;
 
-function TIATRebuilder.RebuildImports(const InDumpFile, OutFixedFile: string): TIATResult;
+function TIATRebuilder64.RebuildImports(const InDumpFile, OutFixedFile: string;
+  StubStartRVA, StubEndRVA: Cardinal): TIAT64Result;
 var
-  R: TIATResult;
+  R: TIAT64Result;
   f, blob, strbytes: TBytes;
   fs: TFileStream;
   lfanew, optOfs, secTab, ddBase: Cardinal;
-  numSecs, sizeOpt: Word;
+  numSecs, sizeOpt, dllChar: Word;
   secAlign, fileAlign, sizeOfHeaders: Cardinal;
   i, scanEnd: NativeInt;
-  V: Cardinal;
-  cls: Integer;                       // 0=other, 1=impptr, 2=zero
+  V: UInt64;
+  cls, zeroRun: Integer;
   runStart, runImp, runFirstImp, runLastImp: NativeInt;
-  bestStart, bestEnd: NativeInt;
-  bestImp: Integer;
+  bestStart, bestEnd, stubStartSave, stubEndSave: NativeInt;
+  bestImp, stubImpSave: Integer;
   iatStart, iatEnd: Cardinal;
-  groups: TList<TImpGroup>;
-  curEntries: TList<TImp>;
-  g: TImpGroup;
+  groups: TList<TImpGroup64>;
+  curEntries: TList<TImp64>;
+  g: TImpGroup64;
   curMod: Integer;
   grpStart: Cardinal;
   mIdx: Integer;
-  imp: TImp;
+  imp: TImp64;
   descCount, descSize, iltTotal, strBase, blobSize: Cardinal;
   runIlt: Cardinal;
   gi, k: Integer;
@@ -375,11 +390,69 @@ var
     curMod := -1;
   end;
 
+  procedure ScanRange(StartAlign: NativeInt; SkipStub: Boolean);
+  begin
+    runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
+    zeroRun := 0;
+
+    i := StartAlign;
+    while i <= scanEnd do
+    begin
+      if SkipStub and (StubEndRVA > StubStartRVA) and
+         (Cardinal(i) >= StubStartRVA) and (Cardinal(i) < StubEndRVA) then
+        cls := 0
+      else
+      begin
+        V := PUInt64(@f[i])^;
+        if V = 0 then
+        begin
+          Inc(zeroRun);
+          if (runStart >= 0) and (zeroRun <= MAX_ZERO_GAP) then
+            cls := 2
+          else
+            cls := 0;
+        end
+        else
+        begin
+          zeroRun := 0;
+          if (ModuleOf(V) <> nil) and (not ModuleOf(V).IsImage) then
+            cls := 1
+          else
+            cls := 0;
+        end;
+      end;
+
+      if cls = 0 then
+      begin
+        if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
+        begin
+          bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 8;
+        end;
+        runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
+        zeroRun := 0;
+      end
+      else
+      begin
+        if runStart < 0 then runStart := i;
+        if cls = 1 then
+        begin
+          Inc(runImp);
+          if runFirstImp < 0 then runFirstImp := i;
+          runLastImp := i;
+        end;
+      end;
+      Inc(i, 8);
+    end;
+    if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
+    begin
+      bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 8;
+    end;
+  end;
+
 begin
-  R := Default(TIATResult);
+  R := Default(TIAT64Result);
   R.OutFile := OutFixedFile;
 
-  // ---- load dump + parse headers ----
   try
     fs := TFileStream.Create(InDumpFile, fmOpenRead or fmShareDenyWrite);
     try
@@ -402,13 +475,18 @@ begin
     Exit(R);
   end;
   lfanew := PCardinal(@f[$3C])^;
-  optOfs := lfanew + 24;
-  if PWord(@f[optOfs])^ <> $10B then
+  if UInt64(lfanew) + 24 + 112 + (DDIR_IAT + 1) * 8 > UInt64(Length(f)) then
   begin
-    R.Message := 'Dump is not PE32 (32-bit).';
+    R.Message := 'Dump headers are truncated; cannot rebuild.';
     Exit(R);
   end;
-  FImageBase    := PCardinal(@f[optOfs + 28])^;
+  optOfs := lfanew + 24;
+  if PWord(@f[optOfs])^ <> $20B then
+  begin
+    R.Message := 'Dump is not PE32+ (64-bit).';
+    Exit(R);
+  end;
+  FImageBase    := PUInt64(@f[optOfs + 24])^;
   FSizeOfImage  := PCardinal(@f[optOfs + 56])^;
   sizeOfHeaders := PCardinal(@f[optOfs + 60])^;
   secAlign      := PCardinal(@f[optOfs + 32])^;
@@ -416,15 +494,25 @@ begin
   numSecs       := PWord(@f[lfanew + 6])^;
   sizeOpt       := PWord(@f[lfanew + 20])^;
   secTab        := optOfs + sizeOpt;
-  ddBase        := optOfs + 96;
+  ddBase        := optOfs + 112;
 
-  if (Cardinal(Length(f)) < optOfs + 64) or
-     (Cardinal(Length(f)) < secTab + Cardinal(numSecs) * 40) or
-     (Cardinal(Length(f)) < ddBase + (DDIR_IAT + 1) * 8) then
+  if UInt64(secTab) + UInt64(numSecs) * 40 > UInt64(Length(f)) then
   begin
     R.Message := 'Dump headers are truncated; cannot rebuild.';
     Exit(R);
   end;
+
+  if (fileAlign = 0) or ((fileAlign and (fileAlign - 1)) <> 0) or
+     (secAlign = 0)  or ((secAlign and (secAlign - 1)) <> 0) or
+     (fileAlign > $10000) or (secAlign < fileAlign) or
+     (FSizeOfImage > $40000000) then
+  begin
+    R.Message := 'Dump has invalid alignment/size fields; cannot rebuild.';
+    Exit(R);
+  end;
+
+  if sizeOfHeaders > Cardinal(Length(f)) then
+    sizeOfHeaders := Cardinal(Length(f));
 
   EnumModules;
   if FMods.Count = 0 then
@@ -433,48 +521,26 @@ begin
     Exit(R);
   end;
 
-  // ---- scan for the IAT (best run of module pointers) ----
-  scanEnd := Length(f) - 4;
-  if NativeInt(FSizeOfImage) - 4 < scanEnd then scanEnd := NativeInt(FSizeOfImage) - 4;
+  // scan for the IAT (best run of 8-byte module pointers; check +0 and +4 alignments)
+  scanEnd := Length(f) - 8;
+  if NativeInt(FSizeOfImage) - 8 < scanEnd then scanEnd := NativeInt(FSizeOfImage) - 8;
 
   bestStart := -1; bestEnd := -1; bestImp := 0;
-  runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
-
-  i := sizeOfHeaders;
-  while i <= scanEnd do
+  ScanRange(sizeOfHeaders, False);
+  ScanRange(sizeOfHeaders + 4, False);
+  if (bestStart >= 0) and (bestImp <= 5) and (StubEndRVA > StubStartRVA) and
+     (Cardinal(bestStart) >= StubStartRVA) and (Cardinal(bestStart) < StubEndRVA) then
   begin
-    V := PCardinal(@f[i])^;
-    if V = 0 then
-      cls := 2
-    else if (ModuleOf(V) <> nil) and (not ModuleOf(V).IsImage) then
-      cls := 1
-    else
-      cls := 0;
-
-    if cls = 0 then
+    stubStartSave := bestStart;
+    stubEndSave := bestEnd;
+    stubImpSave := bestImp;
+    bestStart := -1; bestEnd := -1; bestImp := 0;
+    ScanRange(sizeOfHeaders, True);
+    ScanRange(sizeOfHeaders + 4, True);
+    if bestStart < 0 then
     begin
-      // close current run
-      if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
-      begin
-        bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
-      end;
-      runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
-    end
-    else
-    begin
-      if runStart < 0 then runStart := i;
-      if cls = 1 then
-      begin
-        Inc(runImp);
-        if runFirstImp < 0 then runFirstImp := i;
-        runLastImp := i;
-      end;
+      bestStart := stubStartSave; bestEnd := stubEndSave; bestImp := stubImpSave;
     end;
-    Inc(i, 4);
-  end;
-  if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
-  begin
-    bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
   end;
 
   if bestStart < 0 then
@@ -489,15 +555,14 @@ begin
   R.IATSize := iatEnd - iatStart;
   Log(Format('IAT at RVA $%x .. $%x (%d pointers)', [iatStart, iatEnd, bestImp]));
 
-  // ---- walk the IAT, resolve, group by module ----
-  groups := TList<TImpGroup>.Create;
-  curEntries := TList<TImp>.Create;
+  groups := TList<TImpGroup64>.Create;
+  curEntries := TList<TImp64>.Create;
   curMod := -1; grpStart := 0;
   try
     i := iatStart;
-    while i <= NativeInt(iatEnd) - 4 do
+    while i <= NativeInt(iatEnd) - 8 do
     begin
-      V := PCardinal(@f[i])^;
+      V := PUInt64(@f[i])^;
       if V = 0 then
         CloseGroup
       else if Resolve(V, mIdx, imp) then
@@ -517,9 +582,9 @@ begin
       else
       begin
         Inc(R.Unresolved);
-        CloseGroup;                    // unresolved pointer breaks the group
+        CloseGroup;
       end;
-      Inc(i, 4);
+      Inc(i, 8);
     end;
     CloseGroup;
 
@@ -530,7 +595,6 @@ begin
       Exit(R);
     end;
 
-    // ---- lay out the new blob: descriptors | ILTs | strings ----
     descCount := groups.Count;
     descSize := (descCount + 1) * 20;
 
@@ -540,12 +604,11 @@ begin
       g := groups[gi];
       g.ILTOffset := runIlt;
       groups[gi] := g;
-      runIlt := runIlt + Cardinal(Length(g.Entries) + 1) * 4;
+      runIlt := runIlt + Cardinal(Length(g.Entries) + 1) * 8;
     end;
     iltTotal := runIlt - descSize;
     strBase := descSize + iltTotal;
 
-    // intern DLL names and hint/name entries into strbytes (offsets relative to strBase)
     dllOff := TDictionary<Integer, Cardinal>.Create;
     ibnOff := TDictionary<AnsiString, Cardinal>.Create;
     SetLength(strbytes, 0);
@@ -566,44 +629,40 @@ begin
           if g.Entries[k].ByName and (not ibnOff.ContainsKey(g.Entries[k].Name)) then
           begin
             if Odd(Length(strbytes)) then
-              SetLength(strbytes, Length(strbytes) + 1);   // 2-align IMAGE_IMPORT_BY_NAME
+              SetLength(strbytes, Length(strbytes) + 1);
             nm := g.Entries[k].Name;
             o := Cardinal(Length(strbytes));
             ibnOff.Add(nm, o);
             SetLength(strbytes, Length(strbytes) + 2 + Length(nm) + 1);
-            PWord(@strbytes[o])^ := 0;                     // hint
-            Move(nm[1], strbytes[o + 2], Length(nm));
+            PWord(@strbytes[o])^ := 0;
+            if Length(nm) > 0 then Move(nm[1], strbytes[o + 2], Length(nm));
             strbytes[o + 2 + Cardinal(Length(nm))] := 0;
           end;
       end;
 
       blobSize := strBase + Cardinal(Length(strbytes));
 
-      // ---- placement: keep file offset == RVA (matches the dump's layout) ----
       newSecVA := Align(Cardinal(Length(f)), secAlign);
       if newSecVA < Align(FSizeOfImage, secAlign) then
         newSecVA := Align(FSizeOfImage, secAlign);
       baseRVA := newSecVA;
 
-      // room for one more section header?
       if secTab + (Cardinal(numSecs) + 1) * 40 > sizeOfHeaders then
       begin
         R.Message := 'No room in PE header for an extra section.';
         Exit(R);
       end;
 
-      // ---- realise the blob ----
       SetLength(blob, blobSize);
-      // descriptors
+      FillChar(blob[0], blobSize, 0);
       for gi := 0 to groups.Count - 1 do
       begin
         g := groups[gi];
         off := Cardinal(gi) * 20;
-        PCardinal(@blob[off + 0])^  := baseRVA + g.ILTOffset;                 // OriginalFirstThunk
-        PCardinal(@blob[off + 12])^ := baseRVA + strBase + dllOff[g.ModIndex]; // Name
-        PCardinal(@blob[off + 16])^ := g.StartRVA;                            // FirstThunk (existing IAT)
+        PCardinal(@blob[off + 0])^  := baseRVA + g.ILTOffset;
+        PCardinal(@blob[off + 12])^ := baseRVA + strBase + dllOff[g.ModIndex];
+        PCardinal(@blob[off + 16])^ := g.StartRVA;
       end;
-      // ILTs
       for gi := 0 to groups.Count - 1 do
       begin
         g := groups[gi];
@@ -611,44 +670,43 @@ begin
         for k := 0 to High(g.Entries) do
         begin
           if g.Entries[k].ByName then
-            PCardinal(@blob[p])^ := baseRVA + strBase + ibnOff[g.Entries[k].Name]
+            PUInt64(@blob[p])^ := UInt64(baseRVA + strBase + ibnOff[g.Entries[k].Name])
           else
-            PCardinal(@blob[p])^ := IMPORT_BY_ORDINAL or Cardinal(g.Entries[k].Ordinal);
-          Inc(p, 4);
+            PUInt64(@blob[p])^ := IMPORT_BY_ORDINAL64 or UInt64(g.Entries[k].Ordinal);
+          Inc(p, 8);
         end;
-        PCardinal(@blob[p])^ := 0;   // ILT terminator
+        PUInt64(@blob[p])^ := 0;
       end;
-      // strings
       if Length(strbytes) > 0 then
         Move(strbytes[0], blob[strBase], Length(strbytes));
 
-      // ---- splice into the file ----
       rawSize := Align(blobSize, fileAlign);
-      SetLength(f, newSecVA + rawSize);           // zero-pads [oldlen..newSecVA) and the raw tail
+      SetLength(f, newSecVA + rawSize);
       Move(blob[0], f[newSecVA], blobSize);
 
-      // new section header
       off := secTab + Cardinal(numSecs) * 40;
       FillChar(f[off], 40, 0);
       nm := '.ncimp';
-      Move(nm[1], f[off], Length(nm));                      // 8-byte name field, null-padded
-      PCardinal(@f[off + 8])^  := blobSize;                 // VirtualSize
-      PCardinal(@f[off + 12])^ := newSecVA;                 // VirtualAddress
-      PCardinal(@f[off + 16])^ := rawSize;                  // SizeOfRawData
-      PCardinal(@f[off + 20])^ := newSecVA;                 // PointerToRawData (== RVA)
-      PCardinal(@f[off + 36])^ := $C0000040;                // INITIALIZED_DATA | READ | WRITE
+      Move(nm[1], f[off], Length(nm));
+      PCardinal(@f[off + 8])^  := blobSize;
+      PCardinal(@f[off + 12])^ := newSecVA;
+      PCardinal(@f[off + 16])^ := rawSize;
+      PCardinal(@f[off + 20])^ := newSecVA;
+      PCardinal(@f[off + 36])^ := $C0000040;
 
-      // header fixups
-      PWord(@f[lfanew + 6])^    := numSecs + 1;                        // NumberOfSections
-      PCardinal(@f[optOfs + 56])^ := newSecVA + Align(blobSize, secAlign); // SizeOfImage
-      PCardinal(@f[ddBase + DDIR_IMPORT * 8])^     := baseRVA;         // import dir VA
-      PCardinal(@f[ddBase + DDIR_IMPORT * 8 + 4])^ := descSize;        // import dir size
-      PCardinal(@f[ddBase + DDIR_IAT * 8])^        := iatStart;        // IAT dir VA
-      PCardinal(@f[ddBase + DDIR_IAT * 8 + 4])^    := iatEnd - iatStart;
-      PCardinal(@f[ddBase + DDIR_BOUND * 8])^      := 0;               // clear bound imports
-      PCardinal(@f[ddBase + DDIR_BOUND * 8 + 4])^  := 0;
+      PWord(@f[lfanew + 6])^      := numSecs + 1;
+      PCardinal(@f[optOfs + 56])^ := newSecVA + Align(blobSize, secAlign);
+      dllChar := PWord(@f[optOfs + 70])^;
+      PWord(@f[optOfs + 70])^ := dllChar and not Word(DLL_CHAR_DYNAMIC_BASE);
+      PCardinal(@f[ddBase + DDIR_IMPORT * 8])^        := baseRVA;
+      PCardinal(@f[ddBase + DDIR_IMPORT * 8 + 4])^    := descSize;
+      PCardinal(@f[ddBase + DDIR_BASERELOC * 8])^     := 0;
+      PCardinal(@f[ddBase + DDIR_BASERELOC * 8 + 4])^ := 0;
+      PCardinal(@f[ddBase + DDIR_IAT * 8])^           := iatStart;
+      PCardinal(@f[ddBase + DDIR_IAT * 8 + 4])^       := iatEnd - iatStart;
+      PCardinal(@f[ddBase + DDIR_BOUND * 8])^         := 0;
+      PCardinal(@f[ddBase + DDIR_BOUND * 8 + 4])^     := 0;
 
-      // ---- write out ----
       try
         fs := TFileStream.Create(OutFixedFile, fmCreate);
         try

@@ -1,21 +1,19 @@
-program VMTScan;
+unit uVMTScanMain;
 
-{$APPTYPE CONSOLE}
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
 
-{
-  Usage:  VMTScan <target.exe|dll>
+interface
 
-  Lists the Delphi classes recovered from a PE (name, instance size, parent).
-  Output is accessible plain text; exit code reflects the outcome.
-}
+procedure RunVMTScan;
+
+implementation
 
 uses
   SysUtils,
-  Generics.Collections,
-  Generics.Defaults,
-  uConsoleOut in 'uConsoleOut.pas',
-  uPEFile in 'uPEFile.pas',
-  uDelphiVMT in 'uDelphiVMT.pas';
+  uConsoleOut, uPEFile, uDelphiVMT;
 
 function HexVA(V: UInt64; Is64: Boolean): string;
 begin
@@ -27,13 +25,15 @@ begin
   case O of
     -76:  Result := 'Delphi 2-7 (x86)';
     -88:  Result := 'Delphi 2009+ (x86)';
-    -176: Result := 'Delphi (x64)';
+    -100: Result := 'Delphi (x86, C++ ABI)';
+    -176: Result := 'Delphi (x64, classic)';
+    -200: Result := 'Delphi (x64, C++ ABI)';
   else
     Result := 'unknown';
   end;
 end;
 
-procedure Run(const FileName: string);
+procedure ScanFile(const FileName: string);
 var
   PE: TPEFile;
   Sc: TDelphiVMTScanner;
@@ -73,11 +73,7 @@ begin
         Exit;
       end;
 
-      TArray.Sort<TDelphiClass>(arr, TComparer<TDelphiClass>.Construct(
-        function(const A, B: TDelphiClass): Integer
-        begin
-          Result := CompareText(A.Name, B.Name);
-        end));
+      SortClassesByName(arr);
 
       COSection('Classes');
       for i := 0 to High(arr) do
@@ -101,14 +97,16 @@ begin
   end;
 end;
 
+procedure RunVMTScan;
 begin
   if ParamCount < 1 then
   begin
-    COUsage('VMTScan', '<target.exe|dll>', 'List Delphi classes recovered from a PE.');
+    COUsage(ChangeFileExt(ExtractFileName(ParamStr(0)), ''), '<target.exe|dll>',
+      'List Delphi classes recovered from a PE.');
     Halt(EXIT_USAGE);
   end;
   try
-    Run(ParamStr(1));
+    ScanFile(ParamStr(1));
     COOk('Done.');
     Halt(EXIT_OK);
   except
@@ -117,10 +115,17 @@ begin
       COErr('Cannot read input: ' + E.Message);
       Halt(EXIT_INPUT);
     end;
+    on E: EPEFile do
+    begin
+      COErr('Invalid PE input: ' + E.Message);
+      Halt(EXIT_INPUT);
+    end;
     on E: Exception do
     begin
       COErr(E.ClassName + ': ' + E.Message);
       Halt(EXIT_PROCESSING);
     end;
   end;
+end;
+
 end.

@@ -2,6 +2,11 @@ program OEPScan;
 
 {$APPTYPE CONSOLE}
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   Usage:  OEPScan <packed.exe> [dump.exe] [/aad] [/iat]
 
@@ -52,11 +57,7 @@ begin
   if iat and (dumpPath = '') then
     dumpPath := ChangeFileExt(target, '') + '_dump.exe';
 
-  f := TOEPFinder.Create(
-    procedure(const m: string)
-    begin
-      CONote(m);
-    end);
+  f := TOEPFinder.Create(COLogger.Note);
   try
     f.AntiAntiDebug := aad;
     f.RebuildImports := iat;
@@ -73,6 +74,8 @@ begin
     COField('Image base', '$' + IntToHex(Int64(r.ImageBase), 8));
     if r.DumpFile <> '' then
       COField('Dump', r.DumpFile);
+    if r.FixedFile <> '' then
+      COField('Fixed', r.FixedFile);
     COOk(r.Message);
     Halt(EXIT_OK);
   end

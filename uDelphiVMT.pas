@@ -1,5 +1,10 @@
 unit uDelphiVMT;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uDelphiVMT - recovers the class list and hierarchy from a Delphi PE.
 
@@ -80,6 +85,8 @@ type
     property SelfPtrOffset: Integer read FSelfPtrOffset;
   end;
 
+procedure SortClassesByName(var List: TArray<TDelphiClass>);
+
 implementation
 
 const
@@ -140,7 +147,7 @@ function TDelphiVMTScanner.TryReadClassAt(ClassVA: UInt64; SelfPtr: Integer;
   out Info: TDelphiClass): Boolean;
 var
   ptr: Integer;
-  cnPtr: UInt64;
+  cnPtr, isize64: UInt64;
   name: AnsiString;
   isize: Cardinal;
   r: Int64;
@@ -154,9 +161,10 @@ begin
   if not FPE.ReadShortStringVA(cnPtr, name) then Exit;
   if not ValidName(name) then Exit;
 
-  // vmtInstanceSize
-  if not FPE.ReadDWordVA(FieldVA(ClassVA, IDX_INSTANCESIZE, SelfPtr, ptr), isize) then Exit;
-  if (isize < Cardinal(ptr)) or (isize > MAX_INSTANCE_SIZE) then Exit;
+  // vmtInstanceSize (4 bytes on x86, 8 bytes on x64)
+  if not FPE.ReadPtrVA(FieldVA(ClassVA, IDX_INSTANCESIZE, SelfPtr, ptr), isize64) then Exit;
+  if (isize64 < UInt64(ptr)) or (isize64 > MAX_INSTANCE_SIZE) then Exit;
+  isize := Cardinal(isize64);
 
   Info.ClassVA := ClassVA;
   r := FPE.VAToRVA(ClassVA);
@@ -289,9 +297,9 @@ var
   bestOff, i: Integer;
 begin
   if FPE.Is64Bit then
-    cands := TArray<Integer>.Create(-176)
+    cands := TArray<Integer>.Create(-200, -176, -216, -192)
   else
-    cands := TArray<Integer>.Create(-88, -76);
+    cands := TArray<Integer>.Create(-88, -76, -100, -108, -96);
 
   best := nil;
   bestOff := cands[0];
@@ -322,6 +330,37 @@ begin
   Result := -1;
   for i := 0 to High(FClasses) do
     if FClasses[i].ClassVA = VA then Exit(i);
+end;
+
+procedure SortClassesByName(var List: TArray<TDelphiClass>);
+
+  procedure QuickSort(L, R: Integer);
+  var
+    i, j: Integer;
+    pivot, tmp: TDelphiClass;
+  begin
+    i := L;
+    j := R;
+    pivot := List[(L + R) div 2];
+    repeat
+      while CompareText(List[i].Name, pivot.Name) < 0 do Inc(i);
+      while CompareText(List[j].Name, pivot.Name) > 0 do Dec(j);
+      if i <= j then
+      begin
+        tmp := List[i];
+        List[i] := List[j];
+        List[j] := tmp;
+        Inc(i);
+        Dec(j);
+      end;
+    until i > j;
+    if L < j then QuickSort(L, j);
+    if i < R then QuickSort(i, R);
+  end;
+
+begin
+  if Length(List) > 1 then
+    QuickSort(0, High(List));
 end;
 
 end.

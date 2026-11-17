@@ -1,33 +1,38 @@
-program OEPScan;
+program OEPScan64;
 
 {$APPTYPE CONSOLE}
 
-{
-  Usage:  OEPScan <packed.exe> [dump.exe] [/aad] [/iat]
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
 
-    /aad   hide the debugger from the target (PEB patch + ntdll hooks)
+{
+  Usage:  OEPScan64 <packed.exe> [dump.exe] [/aad] [/iat]
+
+    /aad   hide the debugger from the target (x64 PEB patch + ntdll hooks)
     /iat   after dumping, rebuild the import table (-> *_fixed.exe)
 
-  Finds the OEP of a packed 32-bit PE by stripping execute from non-stub
-  sections and catching the execute fault. Build 32-bit. VM only.
+  Finds the OEP of a packed 64-bit PE by stripping execute from non-stub
+  sections and catching the execute fault. Build 64-bit (dcc64/ppcx64). VM only.
 }
 
 uses
   SysUtils,
   uConsoleOut in 'uConsoleOut.pas',
-  uOEPFinder in 'uOEPFinder.pas';
+  uOEPFinder64 in 'uOEPFinder64.pas';
 
 var
   target, dumpPath, a: string;
-  r: TOEPResult;
-  f: TOEPFinder;
+  r: TOEP64Result;
+  f: TOEPFinder64;
   i: Integer;
   aad, iat: Boolean;
 begin
   if ParamCount < 1 then
   begin
-    COUsage('OEPScan', '<packed.exe> [dump.exe] [/aad] [/iat]',
-      'Find the OEP of a packed 32-bit PE; optionally hide the debugger and rebuild imports.');
+    COUsage('OEPScan64', '<packed.exe> [dump.exe] [/aad] [/iat]',
+      'Find the OEP of a packed 64-bit PE; optionally hide the debugger and rebuild imports.');
     Halt(EXIT_USAGE);
   end;
 
@@ -48,15 +53,10 @@ begin
     end;
   end;
 
-  // rebuilding imports needs a dump to work from
   if iat and (dumpPath = '') then
     dumpPath := ChangeFileExt(target, '') + '_dump.exe';
 
-  f := TOEPFinder.Create(
-    procedure(const m: string)
-    begin
-      CONote(m);
-    end);
+  f := TOEPFinder64.Create(COLogger.Note);
   try
     f.AntiAntiDebug := aad;
     f.RebuildImports := iat;
@@ -68,11 +68,13 @@ begin
   COSection('Result');
   if r.Success then
   begin
-    COField('OEP VA', '$' + IntToHex(Int64(r.OEPVA), 8));
+    COField('OEP VA', '$' + IntToHex(Int64(r.OEPVA), 16));
     COField('OEP RVA', '$' + IntToHex(Int64(r.OEPRVA), 8));
-    COField('Image base', '$' + IntToHex(Int64(r.ImageBase), 8));
+    COField('Image base', '$' + IntToHex(Int64(r.ImageBase), 16));
     if r.DumpFile <> '' then
       COField('Dump', r.DumpFile);
+    if r.FixedFile <> '' then
+      COField('Fixed', r.FixedFile);
     COOk(r.Message);
     Halt(EXIT_OK);
   end

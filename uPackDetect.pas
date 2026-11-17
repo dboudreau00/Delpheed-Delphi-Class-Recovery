@@ -1,5 +1,10 @@
 unit uPackDetect;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uPackDetect - decide whether a PE is packed/protected before you try to
   analyse it, and name the packer when the section layout gives it away.
@@ -256,7 +261,12 @@ begin
         [V.EPSectionEntropy]));
     end;
 
-    if (V.ImportedDLLCount = 1) then
+    if (V.ImportedDLLCount = 0) and (PE.EntryPointRVA <> 0) then
+    begin
+      Inc(V.Confidence, 20);
+      reasons.Add('No imported DLLs (imports likely resolved dynamically)');
+    end
+    else if (V.ImportedDLLCount = 1) then
     begin
       Inc(V.Confidence, 20);
       reasons.Add('Only one imported DLL (imports likely resolved at runtime)');

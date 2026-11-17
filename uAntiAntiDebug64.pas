@@ -1,5 +1,10 @@
 unit uAntiAntiDebug64;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uAntiAntiDebug64 - 64-bit anti-anti-debug. The x64 counterpart of uAntiAntiDebug.
 
@@ -28,7 +33,9 @@ unit uAntiAntiDebug64;
   Build 64-bit. Untrusted samples in a VM only.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 interface
 
@@ -36,7 +43,11 @@ uses
   Windows, SysUtils;
 
 type
+  {$IFDEF FPC}
+  TAAD64Log = procedure(const Msg: string) of object;
+  {$ELSE}
   TAAD64Log = reference to procedure(const Msg: string);
+  {$ENDIF}
 
   TAntiAntiDebug64 = class
   private
@@ -47,12 +58,12 @@ type
     function WPM(Addr: UInt64; const Buf; Size: NativeUInt): Boolean;
     function RU32(Addr: UInt64): Cardinal;
     function RU64(Addr: UInt64): UInt64;
-    procedure PatchPEB;
     function StubHideThread(FnAddr: UInt64; const Orig: TBytes; Cave: UInt64): TBytes;
     function StubQueryProc(FnAddr: UInt64; const Orig: TBytes; Cave: UInt64): TBytes;
     function InstallHook(const FnName: string; QueryProc: Boolean): Boolean;
   public
     constructor Create(hProcess: THandle; ALog: TAAD64Log = nil);
+    procedure PatchPEB(Verbose: Boolean = True);
     function Apply: Boolean;
   end;
 
@@ -66,15 +77,15 @@ function K32Write(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   external kernel32 name 'WriteProcessMemory';
 
 function NtQueryInformationProcess(ProcessHandle: THandle; InfoClass: DWORD;
-  ProcessInformation: Pointer; Len: ULONG; ReturnLength: PULONG): LONG; stdcall;
-  external 'ntdll.dll';
+  ProcessInformation: Pointer; Len: DWORD; ReturnLength: PDWORD): LongInt; stdcall;
+  external 'ntdll.dll' name 'NtQueryInformationProcess';
 
 type
   TProcessBasicInformation = record
-    ExitStatus: LONG;
+    ExitStatus: LongInt;
     PebBaseAddress: Pointer;
     AffinityMask: NativeUInt;
-    BasePriority: LONG;
+    BasePriority: LongInt;
     UniqueProcessId: NativeUInt;
     InheritedFromUniqueProcessId: NativeUInt;
   end;
@@ -119,10 +130,10 @@ begin
   RPM(Addr, Result, 8);
 end;
 
-procedure TAntiAntiDebug64.PatchPEB;
+procedure TAntiAntiDebug64.PatchPEB(Verbose: Boolean);
 var
   pbi: TProcessBasicInformation;
-  retLen: ULONG;
+  retLen: DWORD;
   peb, heap: UInt64;
   b: Byte;
   v: Cardinal;
@@ -130,18 +141,20 @@ begin
   retLen := 0;
   if NtQueryInformationProcess(FProc, 0, @pbi, SizeOf(pbi), @retLen) <> 0 then
   begin
-    Log('PEB query failed; skipping PEB patch.');
+    if Verbose then Log('PEB query failed; skipping PEB patch.');
     Exit;
   end;
   peb := UInt64(pbi.PebBaseAddress);
   if peb = 0 then Exit;
 
   b := 0;
-  if not WPM(peb + $02, b, 1) then Log('Could not clear BeingDebugged.');
+  if (not WPM(peb + $02, b, 1)) and Verbose then
+    Log('Could not clear BeingDebugged.');
 
   v := RU32(peb + $BC);                          // NtGlobalFlag (x64 offset)
   v := v and not Cardinal($70);
-  if not WPM(peb + $BC, v, 4) then Log('Could not clear NtGlobalFlag.');
+  if (not WPM(peb + $BC, v, 4)) and Verbose then
+    Log('Could not clear NtGlobalFlag.');
 
   heap := RU64(peb + $30);                        // ProcessHeap (x64 offset)
   if heap <> 0 then
@@ -153,7 +166,8 @@ begin
     WPM(heap + $74, v, 4);                         // Heap.ForceFlags (x64)
   end;
 
-  Log('PEB patched (BeingDebugged, NtGlobalFlag, heap flags).');
+  if Verbose then
+    Log('PEB patched (BeingDebugged, NtGlobalFlag, heap flags).');
 end;
 
 function TAntiAntiDebug64.StubHideThread(FnAddr: UInt64; const Orig: TBytes;
@@ -204,8 +218,13 @@ begin
 
   P8(pPort);                                     // Lport
   DB($4D); DB($85); DB($C0);                     // test r8, r8
-  DB($74); q := len; DB(0);                      // je pdone
+  DB($74); q := len; DB(0);                      // je +7
   DB($49); DB($C7); DB($00); DB(0); DB(0); DB(0); DB(0);  // mov qword [r8], 0
+  P8(q);
+  DB($48); DB($8B); DB($44); DB($24); DB($28);   // mov rax, [rsp+28h] (ReturnLength)
+  DB($48); DB($85); DB($C0);                     // test rax, rax
+  DB($74); q := len; DB(0);
+  DB($C7); DB($00); DB(8); DB(0); DB(0); DB(0);  // mov dword [rax], 8
   P8(q);
   DB($33); DB($C0); DB($C3);                     // xor eax,eax / ret
 
@@ -221,6 +240,11 @@ begin
   DB($4D); DB($85); DB($C0);
   DB($74); q := len; DB(0);
   DB($41); DB($C7); DB($00); DB($01); DB(0); DB(0); DB(0);  // mov dword [r8], 1
+  P8(q);
+  DB($48); DB($8B); DB($44); DB($24); DB($28);   // mov rax, [rsp+28h] (ReturnLength)
+  DB($48); DB($85); DB($C0);                     // test rax, rax
+  DB($74); q := len; DB(0);
+  DB($C7); DB($00); DB(4); DB(0); DB(0); DB(0);  // mov dword [rax], 4
   P8(q);
   DB($33); DB($C0); DB($C3);
 
@@ -285,7 +309,7 @@ end;
 
 function TAntiAntiDebug64.Apply: Boolean;
 begin
-  PatchPEB;
+  PatchPEB(True);
   InstallHook('NtSetInformationThread', False);
   InstallHook('NtQueryInformationProcess', True);
   Result := True;

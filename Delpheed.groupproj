@@ -1,0 +1,108 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{A1000000-0000-4000-8000-000000000000}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="VMTScan.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="VMTScan64.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="Unpack.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="OEPScan.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="OEPScan64.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="Delpheed.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="Delpheed64.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="VMTScan">
+        <MSBuild Projects="VMTScan.dproj"/>
+    </Target>
+    <Target Name="VMTScan:Clean">
+        <MSBuild Projects="VMTScan.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="VMTScan:Make">
+        <MSBuild Projects="VMTScan.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="VMTScan64">
+        <MSBuild Projects="VMTScan64.dproj"/>
+    </Target>
+    <Target Name="VMTScan64:Clean">
+        <MSBuild Projects="VMTScan64.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="VMTScan64:Make">
+        <MSBuild Projects="VMTScan64.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Unpack">
+        <MSBuild Projects="Unpack.dproj"/>
+    </Target>
+    <Target Name="Unpack:Clean">
+        <MSBuild Projects="Unpack.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="Unpack:Make">
+        <MSBuild Projects="Unpack.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="OEPScan">
+        <MSBuild Projects="OEPScan.dproj"/>
+    </Target>
+    <Target Name="OEPScan:Clean">
+        <MSBuild Projects="OEPScan.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="OEPScan:Make">
+        <MSBuild Projects="OEPScan.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="OEPScan64">
+        <MSBuild Projects="OEPScan64.dproj"/>
+    </Target>
+    <Target Name="OEPScan64:Clean">
+        <MSBuild Projects="OEPScan64.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="OEPScan64:Make">
+        <MSBuild Projects="OEPScan64.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Delpheed">
+        <MSBuild Projects="Delpheed.dproj"/>
+    </Target>
+    <Target Name="Delpheed:Clean">
+        <MSBuild Projects="Delpheed.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="Delpheed:Make">
+        <MSBuild Projects="Delpheed.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Delpheed64">
+        <MSBuild Projects="Delpheed64.dproj"/>
+    </Target>
+    <Target Name="Delpheed64:Clean">
+        <MSBuild Projects="Delpheed64.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="Delpheed64:Make">
+        <MSBuild Projects="Delpheed64.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="VMTScan;VMTScan64;Unpack;OEPScan;OEPScan64;Delpheed;Delpheed64"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="VMTScan:Clean;VMTScan64:Clean;Unpack:Clean;OEPScan:Clean;OEPScan64:Clean;Delpheed:Clean;Delpheed64:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="VMTScan:Make;VMTScan64:Make;Unpack:Make;OEPScan:Make;OEPScan64:Make;Delpheed:Make;Delpheed64:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>
