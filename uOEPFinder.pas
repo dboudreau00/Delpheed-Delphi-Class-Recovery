@@ -1,5 +1,10 @@
 unit uOEPFinder;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uOEPFinder - find the Original Entry Point of a packed 32-bit PE by page
   permissions instead of the ESP trick, so it works on stubs that do NOT begin
@@ -24,32 +29,27 @@ unit uOEPFinder;
 
   Requires DEP to be enforced for the target - the default for 32-bit processes
   on 64-bit Windows. Build and run this 32-bit.
-
-  Complements uUnpacker (the ESP trick): use that when the stub starts with
-  PUSHAD, use this when it does not.
-
-  Limits: a stub that calls VirtualProtect to re-grant execute on the OEP
-  section before jumping will not fault (no detection); code unpacked into a
-  fresh VirtualAlloc region rather than back into the image runs outside the
-  image and is not what gets dumped; and a stub whose helper code runs in a
-  second section will fault there first (add it via ExtraStubSections).
-
-  WARNING: this executes the target's stub. Untrusted samples in a VM only.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 {$IF Defined(WIN64)}
-  {$MESSAGE WARN 'Compile this 32-bit (dcc32) to analyse 32-bit targets.'}
+  {$MESSAGE WARN 'Compile this 32-bit (dcc32/ppc386) to analyse 32-bit targets.'}
 {$IFEND}
 
 interface
 
 uses
-  Windows, SysUtils, Classes, uAntiAntiDebug, uIATRebuild;
+  Windows, SysUtils, Classes, Generics.Collections, uAntiAntiDebug, uIATRebuild;
 
 type
+  {$IFDEF FPC}
+  TOEPLog = procedure(const Msg: string) of object;
+  {$ELSE}
   TOEPLog = reference to procedure(const Msg: string);
+  {$ENDIF}
 
   TOEPResult = record
     Success: Boolean;
@@ -58,6 +58,7 @@ type
     OEPRVA: Cardinal;
     OEPVA: NativeUInt;
     DumpFile: string;         // '' when no dump was requested
+    FixedFile: string;        // '' when no import rebuild succeeded
   end;
 
   TOEPFinder = class
@@ -65,6 +66,7 @@ type
     FLog: TOEPLog;
     FProc: THandle;
     FThread: THandle;
+    FAAD: TAntiAntiDebug;
     FBase: NativeUInt;
     FEntry: NativeUInt;
     FSizeOfImage: Cardinal;
@@ -81,24 +83,23 @@ type
     FOrigEntryByte: Byte;
     FOEP: NativeUInt;
     procedure Log(const S: string);
+    procedure LogAAD(const S: string);
+    procedure LogIAT(const S: string);
     function ReadMem(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
     function WriteMem(Addr: NativeUInt; const Buf; Size: NativeUInt): Boolean;
     function RByte(Addr: NativeUInt): Byte;
     procedure WByte(Addr: NativeUInt; B: Byte);
-    function GetCtx(var Ctx: TContext): Boolean;
-    function SetCtx(var Ctx: TContext): Boolean;
+    function GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+    function SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
     function ParseHeaders: Boolean;
     function SectionOfRVA(RVA: Cardinal): Integer;
     function IsStubSection(Idx: Integer): Boolean;
     procedure StripExecuteFromNonStub;
     function DumpTo(const OutFile: string): Boolean;
   public
-    // Set these before calling Find:
     AntiAntiDebug: Boolean;   // patch PEB / hook ntdll to hide the debugger
     RebuildImports: Boolean;  // after dumping, reconstruct the import table
     constructor Create(ALog: TOEPLog = nil);
-    // ExtraStubSections: indices of any additional sections the stub executes
-    // from (kept executable). Usually leave empty.
     procedure SetExtraStubSections(const Indices: array of Integer);
     function Find(const TargetExe: string; const DumpFile: string = ''): TOEPResult;
   end;
@@ -117,11 +118,14 @@ function K32Protect(hProcess: THandle; lpAddress: Pointer; dwSize: NativeUInt;
 
 const
   DE_EXCEPTION      = 1;
+  DE_CREATE_THREAD  = 2;
   DE_CREATE_PROCESS = 3;
+  DE_EXIT_THREAD    = 4;
   DE_EXIT_PROCESS   = 5;
   DE_LOAD_DLL       = 6;
 
   ST_BREAKPOINT: DWORD       = $80000003;
+  ST_WX86_BREAKPOINT: DWORD  = $4000001F;
   ST_ACCESS_VIOLATION: DWORD = $C0000005;
   ST_GUARD_PAGE: DWORD       = $80000001;
 
@@ -134,7 +138,6 @@ const
 
   ACCESS_EXECUTE = 8;              // ExceptionInformation[0] value for a DEP fault
   PAGE_SIZE      = $1000;
-  SCN_EXECUTE    = $20000000;
 
   MAX_EVENTS = 200000;
 
@@ -156,6 +159,16 @@ end;
 procedure TOEPFinder.Log(const S: string);
 begin
   if Assigned(FLog) then FLog(S);
+end;
+
+procedure TOEPFinder.LogAAD(const S: string);
+begin
+  Log('AAD: ' + S);
+end;
+
+procedure TOEPFinder.LogIAT(const S: string);
+begin
+  Log('IAT: ' + S);
 end;
 
 function TOEPFinder.ReadMem(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
@@ -188,23 +201,37 @@ begin
   WriteMem(Addr, B, 1);
 end;
 
-function TOEPFinder.GetCtx(var Ctx: TContext): Boolean;
+function TOEPFinder.GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  FillChar(Ctx, SizeOf(Ctx), 0);
-  Ctx.ContextFlags := CTX_ALL;
-  Result := GetThreadContext(FThread, Ctx);
+  FillChar(buf, SizeOf(buf), 0);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := GetThreadContext(hThr, pCtx^);
+  if Result then
+    Ctx := pCtx^
+  else
+    FillChar(Ctx, SizeOf(Ctx), 0);
 end;
 
-function TOEPFinder.SetCtx(var Ctx: TContext): Boolean;
+function TOEPFinder.SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  Ctx.ContextFlags := CTX_ALL;
-  Result := SetThreadContext(FThread, Ctx);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^ := Ctx;
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := SetThreadContext(hThr, pCtx^);
 end;
 
 function TOEPFinder.ParseHeaders: Boolean;
 var
   hdr: TBytes;
-  need, i: Integer;
+  need: UInt64;
+  i: Integer;
   machine, magic, numSecs, sizeOpt: Word;
 begin
   Result := False;
@@ -213,7 +240,8 @@ begin
 
   if PWord(@hdr[0])^ <> $5A4D then Exit;
   FLfanew := PCardinal(@hdr[$3C])^;
-  if FLfanew + 256 > Cardinal(Length(hdr)) then
+  if FLfanew > $10000 then Exit;
+  if UInt64(FLfanew) + 256 > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, FLfanew + 1024);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
@@ -228,13 +256,16 @@ begin
 
   FSizeOfImage   := PCardinal(@hdr[FOptOfs + 56])^;
   FSizeOfHeaders := PCardinal(@hdr[FOptOfs + 60])^;
+  if (FSizeOfImage = 0) or (FSizeOfImage > $40000000) then Exit;
   numSecs        := PWord(@hdr[FLfanew + 6])^;
   sizeOpt        := PWord(@hdr[FLfanew + 20])^;
+  if numSecs > 96 then Exit;
   FSecTab        := FOptOfs + sizeOpt;
   FNumSecs       := numSecs;
 
-  need := Integer(FSecTab) + numSecs * 40;
-  if need > Length(hdr) then
+  need := UInt64(FSecTab) + UInt64(numSecs) * 40;
+  if need > $100000 then Exit;
+  if need > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, need + 64);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
@@ -262,7 +293,7 @@ begin
   begin
     vs := FSecVSize[i];
     if vs = 0 then vs := 1;
-    if (RVA >= FSecVA[i]) and (RVA < FSecVA[i] + vs) then Exit(i);
+    if (RVA >= FSecVA[i]) and (UInt64(RVA) < UInt64(FSecVA[i]) + UInt64(vs)) then Exit(i);
   end;
   for i := FNumSecs - 1 downto 0 do
     if RVA >= FSecVA[i] then Exit(i);
@@ -290,9 +321,8 @@ begin
     addr := FBase + FSecVA[i];
     size := FSecVSize[i];
     if size = 0 then size := PAGE_SIZE;
-    size := (size + PAGE_SIZE - 1) and not (PAGE_SIZE - 1);   // round up to page
+    size := (size + PAGE_SIZE - 1) and not (PAGE_SIZE - 1);
     old := 0;
-    // read+write but NOT execute -> unpacking writes are fine, execution faults
     if not K32Protect(FProc, Pointer(addr), size, PAGE_READWRITE, @old) then
       Log(Format('VirtualProtectEx failed on section %d (err %d)', [i, GetLastError]));
   end;
@@ -309,7 +339,15 @@ var
 begin
   Result := False;
   if FSizeOfImage = 0 then Exit;
-  SetLength(buf, FSizeOfImage);
+  try
+    SetLength(buf, FSizeOfImage);
+  except
+    on E: Exception do
+    begin
+      Log('Dump allocation failed: ' + E.Message);
+      Exit;
+    end;
+  end;
 
   off := 0; total := 0;
   while off < FSizeOfImage do
@@ -335,6 +373,11 @@ begin
     if nextVA > thisVA then rawSize := nextVA - thisVA else rawSize := FSecVSize[i];
     PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 16])^ := rawSize;
     PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 20])^ := thisVA;
+    // Uninitialized/packed sections (e.g. UPX0) now contain dumped code/data;
+    // ensure initialized + readable + writable so code/data/IAT work on reload.
+    if ((FSecChar[i] and $00000080) <> 0) or ((FSecChar[i] and $20000000) <> 0) then
+      PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 36])^ :=
+        (FSecChar[i] and not Cardinal($00000080)) or $C0000040;
   end;
 
   try
@@ -364,8 +407,14 @@ var
   contFlag, code: DWORD;
   addr, faultAddr: NativeUInt;
   access: NativeUInt;
-  rva: Cardinal;
+  rva, stubStart, stubEnd: Cardinal;
   sec, events: Integer;
+  threads: TDictionary<DWORD, THandle>;
+  hCurThread: THandle;
+  fixed: string;
+  rb: TIATRebuilder;
+  rbRes: TIATResult;
+  kv: TPair<DWORD, THandle>;
 begin
   Result := Default(TOEPResult);
   FillChar(si, SizeOf(si), 0);
@@ -381,6 +430,9 @@ begin
 
   FProc := pi.hProcess;
   FThread := pi.hThread;
+  FAAD := nil;
+  threads := TDictionary<DWORD, THandle>.Create;
+  threads.Add(pi.dwThreadId, pi.hThread);
   state := stEntry;
   running := True;
   events := 0;
@@ -431,15 +483,22 @@ begin
                 [FBase, FEntry, FSizeOfImage, FNumSecs, FStubSec]));
               if AntiAntiDebug then
               begin
-                var aad := TAntiAntiDebug.Create(FProc,
-                  procedure(const m: string) begin Log('AAD: ' + m); end);
-                try
-                  aad.Apply;
-                finally
-                  aad.Free;
-                end;
+                FAAD := TAntiAntiDebug.Create(FProc, LogAAD);
+                FAAD.Apply;
               end;
             end;
+          end;
+
+        DE_CREATE_THREAD:
+          if (de.CreateThread.hThread <> 0) and (not threads.ContainsKey(de.dwThreadId)) then
+            threads.Add(de.dwThreadId, de.CreateThread.hThread);
+
+        DE_EXIT_THREAD:
+          if threads.TryGetValue(de.dwThreadId, hCurThread) then
+          begin
+            if hCurThread <> pi.hThread then
+              CloseHandle(hCurThread);
+            threads.Remove(de.dwThreadId);
           end;
 
         DE_LOAD_DLL:
@@ -459,24 +518,28 @@ begin
           begin
             code := de.Exception.ExceptionRecord.ExceptionCode;
             addr := NativeUInt(de.Exception.ExceptionRecord.ExceptionAddress);
+            if not threads.TryGetValue(de.dwThreadId, hCurThread) then
+              hCurThread := FThread;
 
             case state of
               stEntry:
-                if (code = ST_BREAKPOINT) and (addr = FEntry) then
+                if ((code = ST_BREAKPOINT) or (code = ST_WX86_BREAKPOINT)) and (addr = FEntry) then
                 begin
-                  if GetCtx(ctx) then
+                  if FAAD <> nil then
+                    FAAD.PatchPEB(False);
+                  if GetCtx(hCurThread, ctx) then
                   begin
-                    WByte(FEntry, FOrigEntryByte);   // restore real instruction
+                    WByte(FEntry, FOrigEntryByte);
                     FlushInstructionCache(FProc, Pointer(FEntry), 1);
-                    ctx.Eip := FEntry;               // rewind over the INT3
-                    ctx.EFlags := ctx.EFlags and not TRAP_FLAG;   // run full speed
-                    SetCtx(ctx);
+                    ctx.Eip := FEntry;
+                    ctx.EFlags := ctx.EFlags and not TRAP_FLAG;
+                    SetCtx(hCurThread, ctx);
                     StripExecuteFromNonStub;
                     state := stRun;
                   end;
                 end
-                else if code = ST_BREAKPOINT then
-                  contFlag := CONT_CONTINUE            // loader / system breakpoint
+                else if (code = ST_BREAKPOINT) or (code = ST_WX86_BREAKPOINT) then
+                  contFlag := CONT_CONTINUE
                 else
                   contFlag := CONT_NOT_HANDLED;
 
@@ -491,7 +554,7 @@ begin
                     faultAddr := de.Exception.ExceptionRecord.ExceptionInformation[1];
                   end;
 
-                  if (access = ACCESS_EXECUTE) and
+                  if ((access = ACCESS_EXECUTE) or ((access = 0) and (addr = faultAddr))) and
                      (faultAddr >= FBase) and (faultAddr < FBase + FSizeOfImage) then
                   begin
                     rva := Cardinal(faultAddr - FBase);
@@ -501,19 +564,19 @@ begin
                       FOEP := faultAddr;
                       Log(Format('OEP at $%x (RVA $%x, section %d)', [FOEP, rva, sec]));
                       state := stDone;
-                      running := False;               // freeze here, do not resume
+                      running := False;
                     end
                     else
-                      contFlag := CONT_NOT_HANDLED;    // execute fault inside stub: pass
+                      contFlag := CONT_NOT_HANDLED;
                   end
                   else
-                    contFlag := CONT_NOT_HANDLED;      // read/write fault or outside image
+                    contFlag := CONT_NOT_HANDLED;
                 end
                 else
                   contFlag := CONT_NOT_HANDLED;
-            end; // case state
+            end;
           end;
-      end; // case event
+      end;
 
       if (not running) and (state = stDone) then
       begin
@@ -530,12 +593,29 @@ begin
             Result.Message  := 'OEP located and image dumped.';
             if RebuildImports then
             begin
-              var fixed := ChangeFileExt(DumpFile, '') + '_fixed.exe';
-              var rb := TIATRebuilder.Create(FProc,
-                procedure(const m: string) begin Log('IAT: ' + m); end);
+              stubStart := 0; stubEnd := 0;
+              if (FStubSec >= 0) and (FStubSec < FNumSecs) then
+              begin
+                stubStart := FSecVA[FStubSec];
+                if FStubSec < FNumSecs - 1 then
+                  stubEnd := FSecVA[FStubSec + 1]
+                else
+                  stubEnd := FSizeOfImage;
+              end;
+              fixed := ChangeFileExt(DumpFile, '') + '_fixed.exe';
+              rb := TIATRebuilder.Create(FProc, LogIAT);
               try
-                if rb.RebuildImports(DumpFile, fixed).Success then
+                rbRes := rb.RebuildImports(DumpFile, fixed, stubStart, stubEnd);
+                if rbRes.Success then
+                begin
+                  Result.FixedFile := fixed;
                   Result.Message := Result.Message + ' Imports rebuilt: ' + fixed;
+                end
+                else
+                begin
+                  Log('IAT: ' + rbRes.Message);
+                  Result.Message := Result.Message + ' Import rebuild skipped (' + rbRes.Message + ').';
+                end;
               finally
                 rb.Free;
               end;
@@ -544,14 +624,19 @@ begin
           else
             Result.Message := 'OEP located, but dump failed.';
         end;
-        Break;                                       // do not resume the payload
+        Break;
       end;
 
       ContinueDebugEvent(de.dwProcessId, de.dwThreadId, contFlag);
-    end; // while
+    end;
   finally
     if FProc <> 0 then
       TerminateProcess(FProc, 0);
+    for kv in threads do
+      if kv.Value <> pi.hThread then
+        CloseHandle(kv.Value);
+    threads.Free;
+    FAAD.Free;
     if pi.hThread <> 0 then CloseHandle(pi.hThread);
     if pi.hProcess <> 0 then CloseHandle(pi.hProcess);
   end;

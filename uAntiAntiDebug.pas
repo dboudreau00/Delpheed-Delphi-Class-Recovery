@@ -1,10 +1,16 @@
 unit uAntiAntiDebug;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uAntiAntiDebug - hide our debugger from a target that tries to detect it, so
   the OEP finder / unpacker survive against protectors (ScyllaHide-lite).
 
-  Applied once, at process create, before the stub runs. Two layers:
+  Applied at process create (and heap re-patched once the loader has created
+  ProcessHeap):
 
   1. PEB / heap patching (reliable, low risk):
        * PEB.BeingDebugged  (+0x02) -> 0   defeats IsDebuggerPresent
@@ -27,7 +33,9 @@ unit uAntiAntiDebug;
   target before patching, which catches a base mismatch.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 interface
 
@@ -35,7 +43,11 @@ uses
   Windows, SysUtils;
 
 type
+  {$IFDEF FPC}
+  TAADLog = procedure(const Msg: string) of object;
+  {$ELSE}
   TAADLog = reference to procedure(const Msg: string);
+  {$ENDIF}
 
   TAntiAntiDebug = class
   private
@@ -45,12 +57,12 @@ type
     function RPM(Addr: NativeUInt; var Buf; Size: NativeUInt): Boolean;
     function WPM(Addr: NativeUInt; const Buf; Size: NativeUInt): Boolean;
     function RU32(Addr: NativeUInt): Cardinal;
-    procedure PatchPEB;
     function StubHideThread(FnAddr: NativeUInt; const Orig: TBytes; Cave: NativeUInt): TBytes;
     function StubQueryProc(FnAddr: NativeUInt; const Orig: TBytes; Cave: NativeUInt): TBytes;
     function InstallHook(const FnName: string; QueryProc: Boolean): Boolean;
   public
     constructor Create(hProcess: THandle; ALog: TAADLog = nil);
+    procedure PatchPEB(Verbose: Boolean = True);
     function Apply: Boolean;
   end;
 
@@ -64,15 +76,15 @@ function K32Write(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   external kernel32 name 'WriteProcessMemory';
 
 function NtQueryInformationProcess(ProcessHandle: THandle; InfoClass: DWORD;
-  ProcessInformation: Pointer; Len: ULONG; ReturnLength: PULONG): LONG; stdcall;
-  external 'ntdll.dll';
+  ProcessInformation: Pointer; Len: DWORD; ReturnLength: PDWORD): LongInt; stdcall;
+  external 'ntdll.dll' name 'NtQueryInformationProcess';
 
 type
   TProcessBasicInformation = record
-    ExitStatus: LONG;
+    ExitStatus: LongInt;
     PebBaseAddress: Pointer;
     AffinityMask: NativeUInt;
-    BasePriority: LONG;
+    BasePriority: LongInt;
     UniqueProcessId: NativeUInt;
     InheritedFromUniqueProcessId: NativeUInt;
   end;
@@ -111,10 +123,10 @@ begin
   RPM(Addr, Result, 4);
 end;
 
-procedure TAntiAntiDebug.PatchPEB;
+procedure TAntiAntiDebug.PatchPEB(Verbose: Boolean);
 var
   pbi: TProcessBasicInformation;
-  retLen: ULONG;
+  retLen: DWORD;
   peb, heap: NativeUInt;
   b: Byte;
   v: Cardinal;
@@ -122,18 +134,20 @@ begin
   retLen := 0;
   if NtQueryInformationProcess(FProc, 0, @pbi, SizeOf(pbi), @retLen) <> 0 then
   begin
-    Log('PEB query failed; skipping PEB patch.');
+    if Verbose then Log('PEB query failed; skipping PEB patch.');
     Exit;
   end;
   peb := NativeUInt(pbi.PebBaseAddress);
   if peb = 0 then Exit;
 
   b := 0;
-  if not WPM(peb + $02, b, 1) then Log('Could not clear BeingDebugged.');
+  if (not WPM(peb + $02, b, 1)) and Verbose then
+    Log('Could not clear BeingDebugged.');
 
   v := RU32(peb + $68);
   v := v and not Cardinal($70);
-  if not WPM(peb + $68, v, 4) then Log('Could not clear NtGlobalFlag.');
+  if (not WPM(peb + $68, v, 4)) and Verbose then
+    Log('Could not clear NtGlobalFlag.');
 
   heap := RU32(peb + $18);
   if heap <> 0 then
@@ -145,7 +159,8 @@ begin
     WPM(heap + $44, v, 4);                                // ForceFlags = 0
   end;
 
-  Log('PEB patched (BeingDebugged, NtGlobalFlag, heap flags).');
+  if Verbose then
+    Log('PEB patched (BeingDebugged, NtGlobalFlag, heap flags).');
 end;
 
 function TAntiAntiDebug.StubHideThread(FnAddr: NativeUInt; const Orig: TBytes;
@@ -288,7 +303,7 @@ end;
 
 function TAntiAntiDebug.Apply: Boolean;
 begin
-  PatchPEB;
+  PatchPEB(True);
   InstallHook('NtSetInformationThread', False);
   InstallHook('NtQueryInformationProcess', True);
   Result := True;   // best-effort; the PEB patch is the baseline and rarely fails

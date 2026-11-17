@@ -1,5 +1,10 @@
 unit uIATRebuild;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uIATRebuild - reconstruct the import table of an unpacked dump so it loads again.
 
@@ -20,29 +25,27 @@ unit uIATRebuild;
     5. Point the PE's import data directory at the new descriptors.
 
   MUST be called while the target is still alive and frozen at the OEP (its DLLs
-  loaded, its IAT resolved). That means calling it from inside the OEP finder,
-  before it terminates the process - see the integration note shipped with this.
+  loaded, its IAT resolved).
 
   32-bit (PE32) targets. Build 32-bit.
-
-  Honest limits: entries the packer resolved by GetProcAddress land on exact
-  export addresses and resolve cleanly; forwarded exports resolve because we
-  match the final address in the destination DLL; anything that doesn't match an
-  export (hooked/redirected thunks) is counted as unresolved and left as a raw
-  pointer, which only works at runtime if that DLL loads at the same base. The
-  IAT search is heuristic (longest module-pointer run); a disassembly-from-OEP
-  search would be more precise but needs a disassembler.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 interface
 
 uses
-  Windows, SysUtils, Classes, Generics.Collections, TlHelp32;
+  Windows, SysUtils, Classes, Generics.Collections,
+  {$IFDEF FPC}JwaTlHelp32{$ELSE}TlHelp32{$ENDIF};
 
 type
+  {$IFDEF FPC}
+  TIATLog = procedure(const Msg: string) of object;
+  {$ELSE}
   TIATLog = reference to procedure(const Msg: string);
+  {$ENDIF}
 
   TIATResult = record
     Success: Boolean;
@@ -106,7 +109,8 @@ type
   public
     constructor Create(hProcess: THandle; ALog: TIATLog = nil);
     destructor Destroy; override;
-    function RebuildImports(const InDumpFile, OutFixedFile: string): TIATResult;
+    function RebuildImports(const InDumpFile, OutFixedFile: string;
+      StubStartRVA: Cardinal = 0; StubEndRVA: Cardinal = 0): TIATResult;
   end;
 
 implementation
@@ -114,13 +118,19 @@ implementation
 function K32Read(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   nSize: NativeUInt; lpRead: PNativeUInt): BOOL; stdcall;
   external kernel32 name 'ReadProcessMemory';
+function K32GetPid(hProcess: THandle): DWORD; stdcall;
+  external kernel32 name 'GetProcessId';
 
 const
-  MIN_IMPORTS = 5;
+  MIN_IMPORTS = 3;
+  MAX_ZERO_GAP = 4;
   IMPORT_BY_ORDINAL = $80000000;
-  DDIR_IMPORT = 1;
-  DDIR_BOUND  = 11;
-  DDIR_IAT    = 12;
+  DDIR_IMPORT    = 1;
+  DDIR_BASERELOC = 5;
+  DDIR_BOUND     = 11;
+  DDIR_IAT       = 12;
+  DLL_CHAR_DYNAMIC_BASE = $0040;
+  SNAP_MOD_FLAGS = $00000008 or $00000010;   // TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32
 
 function Align(V, A: Cardinal): Cardinal;
 begin
@@ -205,9 +215,17 @@ var
   me: TModuleEntry32;
   M: TModExports;
   pid: DWORD;
+  tries: Integer;
 begin
-  pid := GetProcessId(FProc);
-  snap := CreateToolhelp32Snapshot(TH32CS_SNAPMODULE or TH32CS_SNAPMODULE32, pid);
+  pid := K32GetPid(FProc);
+  snap := INVALID_HANDLE_VALUE;
+  for tries := 1 to 5 do
+  begin
+    snap := CreateToolhelp32Snapshot(SNAP_MOD_FLAGS, pid);
+    if snap <> INVALID_HANDLE_VALUE then Break;
+    if GetLastError <> ERROR_BAD_LENGTH then Break;
+    Sleep(10);
+  end;
   if snap = INVALID_HANDLE_VALUE then Exit;
   try
     FillChar(me, SizeOf(me), 0);
@@ -233,9 +251,10 @@ var
   lfanew, optOfs, ddBase: NativeUInt;
   magic: Word;
   numFuncs, numNames, aof, aon, aoo, i: Cardinal;
-  nameRVA: Cardinal;
+  nameRVA, rva: Cardinal;
   ordv: Word;
   raw: TBytes;
+  prevIdx: Integer;
 begin
   M.Parsed := True;
   M.HasExports := False;
@@ -249,7 +268,7 @@ begin
   else
     ddBase := optOfs + 96;                           // PE32
 
-  M.ExpDirRVA  := RU32(ddBase + DDIR_IMPORT * 0);    // export = index 0
+  M.ExpDirRVA  := RU32(ddBase);                      // export = index 0
   M.ExpDirSize := RU32(ddBase + 4);
   if M.ExpDirRVA = 0 then Exit;
 
@@ -274,13 +293,23 @@ begin
     nameRVA := RU32(M.Base + aon + i * 4);
     ordv    := RU16(M.Base + aoo + i * 2);
     if ordv < numFuncs then
-      M.NameByIndex[ordv] := RCStr(M.Base + nameRVA);
+      if M.NameByIndex[ordv] = '' then
+        M.NameByIndex[ordv] := RCStr(M.Base + nameRVA);
   end;
 
   M.RVAToIndex.Clear;
   for i := 0 to numFuncs - 1 do
-    if not M.RVAToIndex.ContainsKey(M.FuncRVAs[i]) then
-      M.RVAToIndex.Add(M.FuncRVAs[i], i);
+  begin
+    rva := M.FuncRVAs[i];
+    if rva = 0 then Continue;
+    // Skip forwarder strings sitting inside the export directory
+    if (M.ExpDirSize > 0) and (rva >= M.ExpDirRVA) and (rva < M.ExpDirRVA + M.ExpDirSize) then
+      Continue;
+    if not M.RVAToIndex.TryGetValue(rva, prevIdx) then
+      M.RVAToIndex.Add(rva, Integer(i))
+    else if (M.NameByIndex[prevIdx] = '') and (M.NameByIndex[i] <> '') then
+      M.RVAToIndex.AddOrSetValue(rva, Integer(i));
+  end;
 
   M.HasExports := True;
 end;
@@ -329,20 +358,21 @@ begin
   Result := True;
 end;
 
-function TIATRebuilder.RebuildImports(const InDumpFile, OutFixedFile: string): TIATResult;
+function TIATRebuilder.RebuildImports(const InDumpFile, OutFixedFile: string;
+  StubStartRVA, StubEndRVA: Cardinal): TIATResult;
 var
   R: TIATResult;
   f, blob, strbytes: TBytes;
   fs: TFileStream;
   lfanew, optOfs, secTab, ddBase: Cardinal;
-  numSecs, sizeOpt: Word;
+  numSecs, sizeOpt, dllChar: Word;
   secAlign, fileAlign, sizeOfHeaders: Cardinal;
   i, scanEnd: NativeInt;
   V: Cardinal;
-  cls: Integer;                       // 0=other, 1=impptr, 2=zero
+  cls, zeroRun: Integer;              // 0=other, 1=impptr, 2=zero
   runStart, runImp, runFirstImp, runLastImp: NativeInt;
-  bestStart, bestEnd: NativeInt;
-  bestImp: Integer;
+  bestStart, bestEnd, stubStartSave, stubEndSave: NativeInt;
+  bestImp, stubImpSave: Integer;
   iatStart, iatEnd: Cardinal;
   groups: TList<TImpGroup>;
   curEntries: TList<TImp>;
@@ -375,6 +405,66 @@ var
     curMod := -1;
   end;
 
+  procedure ScanRange(SkipStub: Boolean);
+  begin
+    bestStart := -1; bestEnd := -1; bestImp := 0;
+    runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
+    zeroRun := 0;
+
+    i := sizeOfHeaders;
+    while i <= scanEnd do
+    begin
+      if SkipStub and (StubEndRVA > StubStartRVA) and
+         (Cardinal(i) >= StubStartRVA) and (Cardinal(i) < StubEndRVA) then
+        cls := 0
+      else
+      begin
+        V := PCardinal(@f[i])^;
+        if V = 0 then
+        begin
+          Inc(zeroRun);
+          if (runStart >= 0) and (zeroRun <= MAX_ZERO_GAP) then
+            cls := 2
+          else
+            cls := 0;
+        end
+        else
+        begin
+          zeroRun := 0;
+          if (ModuleOf(V) <> nil) and (not ModuleOf(V).IsImage) then
+            cls := 1
+          else
+            cls := 0;
+        end;
+      end;
+
+      if cls = 0 then
+      begin
+        if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
+        begin
+          bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
+        end;
+        runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
+        zeroRun := 0;
+      end
+      else
+      begin
+        if runStart < 0 then runStart := i;
+        if cls = 1 then
+        begin
+          Inc(runImp);
+          if runFirstImp < 0 then runFirstImp := i;
+          runLastImp := i;
+        end;
+      end;
+      Inc(i, 4);
+    end;
+    if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
+    begin
+      bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
+    end;
+  end;
+
 begin
   R := Default(TIATResult);
   R.OutFile := OutFixedFile;
@@ -402,9 +492,6 @@ begin
     Exit(R);
   end;
   lfanew := PCardinal(@f[$3C])^;
-  // The dump's headers come from an untrusted target's memory; validate the PE
-  // header window in 64-bit before dereferencing anything through lfanew.
-  // 24 (file header) + 96 (to data dirs, PE32) + (DDIR_IAT+1)*8 (through the IAT dir).
   if UInt64(lfanew) + 24 + 96 + (DDIR_IAT + 1) * 8 > UInt64(Length(f)) then
   begin
     R.Message := 'Dump headers are truncated; cannot rebuild.';
@@ -432,8 +519,6 @@ begin
     Exit(R);
   end;
 
-  // Alignment fields feed Align(); a zero or non-power-of-two value makes Align()
-  // return 0 and turns the section-append below into an out-of-bounds heap write.
   if (fileAlign = 0) or ((fileAlign and (fileAlign - 1)) <> 0) or
      (secAlign = 0)  or ((secAlign and (secAlign - 1)) <> 0) or
      (fileAlign > $10000) or (secAlign < fileAlign) or
@@ -443,8 +528,6 @@ begin
     Exit(R);
   end;
 
-  // sizeOfHeaders drives the IAT-scan start and the section-room check; clamp it so
-  // a bogus value cannot truncate to a negative scan index on a 32-bit build.
   if sizeOfHeaders > Cardinal(Length(f)) then
     sizeOfHeaders := Cardinal(Length(f));
 
@@ -459,44 +542,18 @@ begin
   scanEnd := Length(f) - 4;
   if NativeInt(FSizeOfImage) - 4 < scanEnd then scanEnd := NativeInt(FSizeOfImage) - 4;
 
-  bestStart := -1; bestEnd := -1; bestImp := 0;
-  runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
-
-  i := sizeOfHeaders;
-  while i <= scanEnd do
+  ScanRange(False);
+  if (bestStart >= 0) and (bestImp <= 5) and (StubEndRVA > StubStartRVA) and
+     (Cardinal(bestStart) >= StubStartRVA) and (Cardinal(bestStart) < StubEndRVA) then
   begin
-    V := PCardinal(@f[i])^;
-    if V = 0 then
-      cls := 2
-    else if (ModuleOf(V) <> nil) and (not ModuleOf(V).IsImage) then
-      cls := 1
-    else
-      cls := 0;
-
-    if cls = 0 then
+    stubStartSave := bestStart;
+    stubEndSave := bestEnd;
+    stubImpSave := bestImp;
+    ScanRange(True);
+    if bestStart < 0 then
     begin
-      // close current run
-      if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
-      begin
-        bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
-      end;
-      runStart := -1; runImp := 0; runFirstImp := -1; runLastImp := -1;
-    end
-    else
-    begin
-      if runStart < 0 then runStart := i;
-      if cls = 1 then
-      begin
-        Inc(runImp);
-        if runFirstImp < 0 then runFirstImp := i;
-        runLastImp := i;
-      end;
+      bestStart := stubStartSave; bestEnd := stubEndSave; bestImp := stubImpSave;
     end;
-    Inc(i, 4);
-  end;
-  if (runStart >= 0) and (runImp >= MIN_IMPORTS) and (runImp > bestImp) then
-  begin
-    bestImp := runImp; bestStart := runFirstImp; bestEnd := runLastImp + 4;
   end;
 
   if bestStart < 0 then
@@ -539,7 +596,7 @@ begin
       else
       begin
         Inc(R.Unresolved);
-        CloseGroup;                    // unresolved pointer breaks the group
+        CloseGroup;
       end;
       Inc(i, 4);
     end;
@@ -552,7 +609,6 @@ begin
       Exit(R);
     end;
 
-    // ---- lay out the new blob: descriptors | ILTs | strings ----
     descCount := groups.Count;
     descSize := (descCount + 1) * 20;
 
@@ -567,7 +623,6 @@ begin
     iltTotal := runIlt - descSize;
     strBase := descSize + iltTotal;
 
-    // intern DLL names and hint/name entries into strbytes (offsets relative to strBase)
     dllOff := TDictionary<Integer, Cardinal>.Create;
     ibnOff := TDictionary<AnsiString, Cardinal>.Create;
     SetLength(strbytes, 0);
@@ -588,35 +643,32 @@ begin
           if g.Entries[k].ByName and (not ibnOff.ContainsKey(g.Entries[k].Name)) then
           begin
             if Odd(Length(strbytes)) then
-              SetLength(strbytes, Length(strbytes) + 1);   // 2-align IMAGE_IMPORT_BY_NAME
+              SetLength(strbytes, Length(strbytes) + 1);
             nm := g.Entries[k].Name;
             o := Cardinal(Length(strbytes));
             ibnOff.Add(nm, o);
             SetLength(strbytes, Length(strbytes) + 2 + Length(nm) + 1);
-            PWord(@strbytes[o])^ := 0;                     // hint
-            Move(nm[1], strbytes[o + 2], Length(nm));
+            PWord(@strbytes[o])^ := 0;
+            if Length(nm) > 0 then Move(nm[1], strbytes[o + 2], Length(nm));
             strbytes[o + 2 + Cardinal(Length(nm))] := 0;
           end;
       end;
 
       blobSize := strBase + Cardinal(Length(strbytes));
 
-      // ---- placement: keep file offset == RVA (matches the dump's layout) ----
       newSecVA := Align(Cardinal(Length(f)), secAlign);
       if newSecVA < Align(FSizeOfImage, secAlign) then
         newSecVA := Align(FSizeOfImage, secAlign);
       baseRVA := newSecVA;
 
-      // room for one more section header?
       if secTab + (Cardinal(numSecs) + 1) * 40 > sizeOfHeaders then
       begin
         R.Message := 'No room in PE header for an extra section.';
         Exit(R);
       end;
 
-      // ---- realise the blob ----
       SetLength(blob, blobSize);
-      // descriptors
+      FillChar(blob[0], blobSize, 0);
       for gi := 0 to groups.Count - 1 do
       begin
         g := groups[gi];
@@ -625,7 +677,6 @@ begin
         PCardinal(@blob[off + 12])^ := baseRVA + strBase + dllOff[g.ModIndex]; // Name
         PCardinal(@blob[off + 16])^ := g.StartRVA;                            // FirstThunk (existing IAT)
       end;
-      // ILTs
       for gi := 0 to groups.Count - 1 do
       begin
         g := groups[gi];
@@ -638,39 +689,39 @@ begin
             PCardinal(@blob[p])^ := IMPORT_BY_ORDINAL or Cardinal(g.Entries[k].Ordinal);
           Inc(p, 4);
         end;
-        PCardinal(@blob[p])^ := 0;   // ILT terminator
+        PCardinal(@blob[p])^ := 0;
       end;
-      // strings
       if Length(strbytes) > 0 then
         Move(strbytes[0], blob[strBase], Length(strbytes));
 
-      // ---- splice into the file ----
       rawSize := Align(blobSize, fileAlign);
-      SetLength(f, newSecVA + rawSize);           // zero-pads [oldlen..newSecVA) and the raw tail
+      SetLength(f, newSecVA + rawSize);
       Move(blob[0], f[newSecVA], blobSize);
 
-      // new section header
       off := secTab + Cardinal(numSecs) * 40;
       FillChar(f[off], 40, 0);
       nm := '.ncimp';
-      Move(nm[1], f[off], Length(nm));                      // 8-byte name field, null-padded
-      PCardinal(@f[off + 8])^  := blobSize;                 // VirtualSize
-      PCardinal(@f[off + 12])^ := newSecVA;                 // VirtualAddress
-      PCardinal(@f[off + 16])^ := rawSize;                  // SizeOfRawData
-      PCardinal(@f[off + 20])^ := newSecVA;                 // PointerToRawData (== RVA)
-      PCardinal(@f[off + 36])^ := $C0000040;                // INITIALIZED_DATA | READ | WRITE
+      Move(nm[1], f[off], Length(nm));
+      PCardinal(@f[off + 8])^  := blobSize;
+      PCardinal(@f[off + 12])^ := newSecVA;
+      PCardinal(@f[off + 16])^ := rawSize;
+      PCardinal(@f[off + 20])^ := newSecVA;
+      PCardinal(@f[off + 36])^ := $C0000040;
 
-      // header fixups
-      PWord(@f[lfanew + 6])^    := numSecs + 1;                        // NumberOfSections
-      PCardinal(@f[optOfs + 56])^ := newSecVA + Align(blobSize, secAlign); // SizeOfImage
-      PCardinal(@f[ddBase + DDIR_IMPORT * 8])^     := baseRVA;         // import dir VA
-      PCardinal(@f[ddBase + DDIR_IMPORT * 8 + 4])^ := descSize;        // import dir size
-      PCardinal(@f[ddBase + DDIR_IAT * 8])^        := iatStart;        // IAT dir VA
-      PCardinal(@f[ddBase + DDIR_IAT * 8 + 4])^    := iatEnd - iatStart;
-      PCardinal(@f[ddBase + DDIR_BOUND * 8])^      := 0;               // clear bound imports
-      PCardinal(@f[ddBase + DDIR_BOUND * 8 + 4])^  := 0;
+      PWord(@f[lfanew + 6])^      := numSecs + 1;
+      PCardinal(@f[optOfs + 56])^ := newSecVA + Align(blobSize, secAlign);
+      // Clear DYNAMIC_BASE and stale base relocations from the packed image
+      dllChar := PWord(@f[optOfs + 70])^;
+      PWord(@f[optOfs + 70])^ := dllChar and not Word(DLL_CHAR_DYNAMIC_BASE);
+      PCardinal(@f[ddBase + DDIR_IMPORT * 8])^        := baseRVA;
+      PCardinal(@f[ddBase + DDIR_IMPORT * 8 + 4])^    := descSize;
+      PCardinal(@f[ddBase + DDIR_BASERELOC * 8])^     := 0;
+      PCardinal(@f[ddBase + DDIR_BASERELOC * 8 + 4])^ := 0;
+      PCardinal(@f[ddBase + DDIR_IAT * 8])^           := iatStart;
+      PCardinal(@f[ddBase + DDIR_IAT * 8 + 4])^       := iatEnd - iatStart;
+      PCardinal(@f[ddBase + DDIR_BOUND * 8])^         := 0;
+      PCardinal(@f[ddBase + DDIR_BOUND * 8 + 4])^     := 0;
 
-      // ---- write out ----
       try
         fs := TFileStream.Create(OutFixedFile, fmCreate);
         try

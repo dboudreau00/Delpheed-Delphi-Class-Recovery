@@ -1,5 +1,10 @@
 unit uPEFile;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uPEFile - minimal, self-contained PE (Portable Executable) reader.
 

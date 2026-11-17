@@ -1,5 +1,10 @@
 unit uUnpacker;
 
+{$IFDEF FPC}
+  {$MODE DELPHI}
+  {$H+}
+{$ENDIF}
+
 {
   uUnpacker - a generic "run and dump" unpacker for 32-bit PE executables.
 
@@ -20,31 +25,27 @@ unit uUnpacker;
 
   WARNING: this RUNS the target's unpacking stub. Only point it at samples you
   are authorised to analyse, and do it inside a throwaway VM.
-
-  Scope / limits (be honest about these):
-    * 32-bit targets only. Build this unit 32-bit (dcc32). PUSHAD/POPAD and the
-      classic ESP trick do not exist on x64; that needs a guard-page method.
-    * Works on plain compressors (UPX, ASPack, older PECompact, MPRESS...).
-      Strong protectors (Themida, VMProtect, Enigma) use anti-debug and will
-      not reach a clean OEP this way.
-    * The import table is NOT reconstructed. The dump is meant to be *analysed*
-      statically (feed it to the PE parser / VMT scanner), not re-run. Making it
-      runnable again needs a Scylla-style IAT rebuild.
 }
 
-{$WARN SYMBOL_PLATFORM OFF}
+{$IFNDEF FPC}
+  {$WARN SYMBOL_PLATFORM OFF}
+{$ENDIF}
 
 {$IF Defined(WIN64)}
-  {$MESSAGE WARN 'Compile this 32-bit (dcc32) to unpack 32-bit targets.'}
+  {$MESSAGE WARN 'Compile this 32-bit (dcc32/ppc386) to unpack 32-bit targets.'}
 {$IFEND}
 
 interface
 
 uses
-  Windows, SysUtils, Classes;
+  Windows, SysUtils, Classes, Generics.Collections;
 
 type
+  {$IFDEF FPC}
+  TUnpackLog = procedure(const Msg: string) of object;
+  {$ELSE}
   TUnpackLog = reference to procedure(const Msg: string);
+  {$ENDIF}
 
   TUnpackResult = record
     Success: Boolean;
@@ -82,12 +83,12 @@ type
     function WriteMem(Addr: NativeUInt; const Buf; Size: NativeUInt): Boolean;
     function RByte(Addr: NativeUInt): Byte;
     procedure WByte(Addr: NativeUInt; B: Byte);
-    function GetCtx(var Ctx: TContext): Boolean;
-    function SetCtx(var Ctx: TContext): Boolean;
+    function GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+    function SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
     function ParseHeaders: Boolean;
     function SectionOfRVA(RVA: Cardinal): Integer;
     procedure SetEntryBP;
-    procedure RemoveEntryBP(var Ctx: TContext);
+    procedure RemoveEntryBP(hThr: THandle; var Ctx: TContext);
     function DumpTo(const OutFile: string): Boolean;
   public
     constructor Create(ALog: TUnpackLog = nil);
@@ -96,8 +97,6 @@ type
 
 implementation
 
-// Import the memory calls ourselves so the byte-count parameter type is fixed
-// regardless of RTL header differences across Delphi versions.
 function K32Read(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   nSize: NativeUInt; lpRead: PNativeUInt): BOOL; stdcall;
   external kernel32 name 'ReadProcessMemory';
@@ -106,32 +105,30 @@ function K32Write(hProcess: THandle; lpBaseAddress, lpBuffer: Pointer;
   external kernel32 name 'WriteProcessMemory';
 
 const
-  // debug event codes
-  DE_EXCEPTION       = 1;
-  DE_CREATE_PROCESS  = 3;
-  DE_EXIT_PROCESS    = 5;
-  DE_LOAD_DLL        = 6;
+  DE_EXCEPTION      = 1;
+  DE_CREATE_THREAD  = 2;
+  DE_CREATE_PROCESS = 3;
+  DE_EXIT_THREAD    = 4;
+  DE_EXIT_PROCESS   = 5;
+  DE_LOAD_DLL       = 6;
 
-  // status codes
-  ST_BREAKPOINT: DWORD  = $80000003;
-  ST_SINGLE_STEP: DWORD = $80000004;
+  ST_BREAKPOINT: DWORD       = $80000003;
+  ST_SINGLE_STEP: DWORD      = $80000004;
+  ST_WX86_SINGLE_STEP: DWORD = $4000001E;
+  ST_WX86_BREAKPOINT: DWORD  = $4000001F;
 
-  // continue flags
-  CONT_CONTINUE: DWORD    = $00010002;   // DBG_CONTINUE
-  CONT_NOT_HANDLED: DWORD = $80010001;   // DBG_EXCEPTION_NOT_HANDLED
+  CONT_CONTINUE: DWORD    = $00010002;
+  CONT_NOT_HANDLED: DWORD = $80010001;
 
-  // creation flag
-  F_DEBUG_ONLY_THIS = $00000002;         // DEBUG_ONLY_THIS_PROCESS
+  F_DEBUG_ONLY_THIS = $00000002;
+  CTX_ALL           = $00010017;
 
-  // x86 CONTEXT flags: CONTROL | INTEGER | SEGMENTS | DEBUG_REGISTERS
-  CTX_ALL = $00010017;
+  TRAP_FLAG   = $00000100;
+  DR7_DR0_RW4 = $000F0001;
 
-  TRAP_FLAG   = $00000100;               // EFLAGS.TF
-  DR7_DR0_RW4 = $000F0001;               // DR0 enabled, break on read/write, 4 bytes
-
-  MAX_STUB_STEPS = 64;                   // give up looking for PUSHAD after this
-  MAX_OEP_STEPS  = 2000;                 // give up looking for the OEP after this
-  MAX_EVENTS     = 200000;               // hard cap on debug-loop iterations
+  MAX_STUB_STEPS = 64;
+  MAX_OEP_STEPS  = 2000;
+  MAX_EVENTS     = 200000;
 
 constructor TGenericUnpacker.Create(ALog: TUnpackLog);
 begin
@@ -171,59 +168,74 @@ end;
 
 procedure TGenericUnpacker.WByte(Addr: NativeUInt; B: Byte);
 begin
-  // WriteProcessMemory transparently adjusts page protection for us.
   WriteMem(Addr, B, 1);
 end;
 
-function TGenericUnpacker.GetCtx(var Ctx: TContext): Boolean;
+function TGenericUnpacker.GetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  FillChar(Ctx, SizeOf(Ctx), 0);
-  Ctx.ContextFlags := CTX_ALL;
-  Result := GetThreadContext(FThread, Ctx);
+  FillChar(buf, SizeOf(buf), 0);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := GetThreadContext(hThr, pCtx^);
+  if Result then
+    Ctx := pCtx^
+  else
+    FillChar(Ctx, SizeOf(Ctx), 0);
 end;
 
-function TGenericUnpacker.SetCtx(var Ctx: TContext): Boolean;
+function TGenericUnpacker.SetCtx(hThr: THandle; var Ctx: TContext): Boolean;
+var
+  buf: array[0..SizeOf(TContext) + 15] of Byte;
+  pCtx: PContext;
 begin
-  Ctx.ContextFlags := CTX_ALL;
-  Result := SetThreadContext(FThread, Ctx);
+  pCtx := PContext((NativeUInt(@buf[0]) + 15) and not NativeUInt(15));
+  pCtx^ := Ctx;
+  pCtx^.ContextFlags := CTX_ALL;
+  Result := SetThreadContext(hThr, pCtx^);
 end;
 
 function TGenericUnpacker.ParseHeaders: Boolean;
 var
   hdr: TBytes;
-  need, i: Integer;
+  need: UInt64;
+  i: Integer;
   machine, magic, numSecs, sizeOpt: Word;
 begin
   Result := False;
   SetLength(hdr, 4096);
   if not ReadMem(FBase, hdr[0], 4096) then Exit;
 
-  if PWord(@hdr[0])^ <> $5A4D then Exit;                  // 'MZ'
+  if PWord(@hdr[0])^ <> $5A4D then Exit;
   FLfanew := PCardinal(@hdr[$3C])^;
-  if FLfanew > $10000 then Exit;                          // absurd e_lfanew (malformed/hostile)
-  if UInt64(FLfanew) + 256 > UInt64(Length(hdr)) then     // 64-bit compare: cannot wrap
+  if FLfanew > $10000 then Exit;
+  if UInt64(FLfanew) + 256 > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, FLfanew + 1024);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
   end;
-  if PCardinal(@hdr[FLfanew])^ <> $00004550 then Exit;    // 'PE'#0#0
+  if PCardinal(@hdr[FLfanew])^ <> $00004550 then Exit;
 
   machine := PWord(@hdr[FLfanew + 4])^;
-  if machine <> $014C then Exit;                          // i386 only
+  if machine <> $014C then Exit;
   FOptOfs := FLfanew + 24;
   magic := PWord(@hdr[FOptOfs])^;
-  if magic <> $10B then Exit;                             // PE32 only
+  if magic <> $10B then Exit;
 
   FSizeOfImage   := PCardinal(@hdr[FOptOfs + 56])^;
   FSizeOfHeaders := PCardinal(@hdr[FOptOfs + 60])^;
-  if (FSizeOfImage = 0) or (FSizeOfImage > $40000000) then Exit;  // 0 or > 1 GB: malformed
+  if (FSizeOfImage = 0) or (FSizeOfImage > $40000000) then Exit;
   numSecs        := PWord(@hdr[FLfanew + 6])^;
   sizeOpt        := PWord(@hdr[FLfanew + 20])^;
+  if numSecs > 96 then Exit;
   FSecTab        := FOptOfs + sizeOpt;
   FNumSecs       := numSecs;
 
-  need := Integer(FSecTab) + numSecs * 40;
-  if need > Length(hdr) then
+  need := UInt64(FSecTab) + UInt64(numSecs) * 40;
+  if need > $100000 then Exit;
+  if need > UInt64(Length(hdr)) then
   begin
     SetLength(hdr, need + 64);
     if not ReadMem(FBase, hdr[0], Length(hdr)) then Exit;
@@ -251,9 +263,8 @@ begin
   begin
     vs := FSecVSize[i];
     if vs = 0 then vs := 1;
-    if (RVA >= FSecVA[i]) and (RVA < FSecVA[i] + vs) then Exit(i);
+    if (RVA >= FSecVA[i]) and (UInt64(RVA) < UInt64(FSecVA[i]) + UInt64(vs)) then Exit(i);
   end;
-  // fall back to the section whose VA is the greatest that is <= RVA
   for i := FNumSecs - 1 downto 0 do
     if RVA >= FSecVA[i] then Exit(i);
 end;
@@ -267,13 +278,13 @@ begin
     Log('Warning: entry breakpoint write did not take; target may run unhooked.');
 end;
 
-procedure TGenericUnpacker.RemoveEntryBP(var Ctx: TContext);
+procedure TGenericUnpacker.RemoveEntryBP(hThr: THandle; var Ctx: TContext);
 begin
   WByte(FEntry, FOrigEntryByte);
   FlushInstructionCache(FProc, Pointer(FEntry), 1);
-  Ctx.Eip := FEntry;                       // rewind over the INT3
-  Ctx.EFlags := Ctx.EFlags or TRAP_FLAG;   // single-step the real entry instruction
-  SetCtx(Ctx);
+  Ctx.Eip := FEntry;
+  Ctx.EFlags := Ctx.EFlags or TRAP_FLAG;
+  SetCtx(hThr, Ctx);
 end;
 
 function TGenericUnpacker.DumpTo(const OutFile: string): Boolean;
@@ -287,7 +298,7 @@ begin
   Result := False;
   if FSizeOfImage = 0 then Exit;
   try
-    SetLength(buf, FSizeOfImage);                // FSizeOfImage is capped in ParseHeaders
+    SetLength(buf, FSizeOfImage);
   except
     on E: Exception do
     begin
@@ -296,7 +307,6 @@ begin
     end;
   end;
 
-  // capture the whole image out of memory, tolerating uncommitted/guarded pages
   off := 0;
   while off < FSizeOfImage do
   begin
@@ -307,18 +317,20 @@ begin
     Inc(off, chunk);
   end;
 
-  // rewrite headers so the on-disk layout matches the in-memory layout
-  PCardinal(@buf[FOptOfs + 28])^ := Cardinal(FBase);              // ImageBase = actual load base
-  PCardinal(@buf[FOptOfs + 16])^ := Cardinal(FOEP - FBase);       // AddressOfEntryPoint = OEP RVA
-  PCardinal(@buf[FOptOfs + 36])^ := PCardinal(@buf[FOptOfs + 32])^; // FileAlignment := SectionAlignment
+  PCardinal(@buf[FOptOfs + 28])^ := Cardinal(FBase);
+  PCardinal(@buf[FOptOfs + 16])^ := Cardinal(FOEP - FBase);
+  PCardinal(@buf[FOptOfs + 36])^ := PCardinal(@buf[FOptOfs + 32])^;
 
   for i := 0 to FNumSecs - 1 do
   begin
     thisVA := FSecVA[i];
     if i < FNumSecs - 1 then nextVA := FSecVA[i + 1] else nextVA := FSizeOfImage;
     if nextVA > thisVA then rawSize := nextVA - thisVA else rawSize := FSecVSize[i];
-    PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 16])^ := rawSize;  // SizeOfRawData
-    PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 20])^ := thisVA;   // PointerToRawData = RVA
+    PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 16])^ := rawSize;
+    PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 20])^ := thisVA;
+    if ((FSecChar[i] and $00000080) <> 0) or ((FSecChar[i] and $20000000) <> 0) then
+      PCardinal(@buf[FSecTab + Cardinal(i) * 40 + 36])^ :=
+        (FSecChar[i] and not Cardinal($00000080)) or $C0000040;
   end;
 
   try
@@ -351,6 +363,9 @@ var
   rva: Cardinal;
   sec, events: Integer;
   b: Byte;
+  threads: TDictionary<DWORD, THandle>;
+  hCurThread: THandle;
+  kv: TPair<DWORD, THandle>;
 begin
   Result := Default(TUnpackResult);
   FillChar(si, SizeOf(si), 0);
@@ -366,6 +381,8 @@ begin
 
   FProc := pi.hProcess;
   FThread := pi.hThread;
+  threads := TDictionary<DWORD, THandle>.Create;
+  threads.Add(pi.dwThreadId, pi.hThread);
   state := stEntry;
   running := True;
   events := 0;
@@ -410,6 +427,18 @@ begin
             end;
           end;
 
+        DE_CREATE_THREAD:
+          if (de.CreateThread.hThread <> 0) and (not threads.ContainsKey(de.dwThreadId)) then
+            threads.Add(de.dwThreadId, de.CreateThread.hThread);
+
+        DE_EXIT_THREAD:
+          if threads.TryGetValue(de.dwThreadId, hCurThread) then
+          begin
+            if hCurThread <> pi.hThread then
+              CloseHandle(hCurThread);
+            threads.Remove(de.dwThreadId);
+          end;
+
         DE_LOAD_DLL:
           if de.LoadDll.hFile <> 0 then
             CloseHandle(de.LoadDll.hFile);
@@ -425,38 +454,40 @@ begin
           begin
             code := de.Exception.ExceptionRecord.ExceptionCode;
             addr := NativeUInt(de.Exception.ExceptionRecord.ExceptionAddress);
+            if not threads.TryGetValue(de.dwThreadId, hCurThread) then
+              hCurThread := FThread;
 
             case state of
               stEntry:
-                if (code = ST_BREAKPOINT) and (addr = FEntry) then
+                if ((code = ST_BREAKPOINT) or (code = ST_WX86_BREAKPOINT)) and (addr = FEntry) then
                 begin
-                  if GetCtx(ctx) then
+                  if GetCtx(hCurThread, ctx) then
                   begin
-                    RemoveEntryBP(ctx);       // restore byte, rewind Eip, set TF
+                    RemoveEntryBP(hCurThread, ctx);
                     FPrevEip := FEntry;
                     FStepCount := 0;
                     state := stStub;
                   end;
                 end
-                else if code = ST_BREAKPOINT then
-                  contFlag := CONT_CONTINUE    // loader / system breakpoint
+                else if (code = ST_BREAKPOINT) or (code = ST_WX86_BREAKPOINT) then
+                  contFlag := CONT_CONTINUE
                 else
                   contFlag := CONT_NOT_HANDLED;
 
               stStub:
-                if code = ST_SINGLE_STEP then
+                if (code = ST_SINGLE_STEP) or (code = ST_WX86_SINGLE_STEP) then
                 begin
                   b := RByte(FPrevEip);
-                  if b = $60 then               // PUSHAD just executed
+                  if b = $60 then
                   begin
-                    if GetCtx(ctx) then
+                    if GetCtx(hCurThread, ctx) then
                     begin
                       esp := ctx.Esp;
                       ctx.Dr0 := esp;
                       ctx.Dr7 := DR7_DR0_RW4;
                       ctx.Dr6 := 0;
-                      ctx.EFlags := ctx.EFlags and not TRAP_FLAG;  // run full speed to POPAD
-                      SetCtx(ctx);
+                      ctx.EFlags := ctx.EFlags and not TRAP_FLAG;
+                      SetCtx(hCurThread, ctx);
                       Log(Format('PUSHAD found; HW bp armed at saved ESP $%x', [esp]));
                       state := stPopad;
                     end;
@@ -470,11 +501,11 @@ begin
                         'No PUSHAD prologue; ESP trick not applicable (needs guard-page method).';
                       running := False;
                     end
-                    else if GetCtx(ctx) then
+                    else if GetCtx(hCurThread, ctx) then
                     begin
                       FPrevEip := ctx.Eip;
                       ctx.EFlags := ctx.EFlags or TRAP_FLAG;
-                      SetCtx(ctx);
+                      SetCtx(hCurThread, ctx);
                     end;
                   end;
                 end
@@ -482,17 +513,17 @@ begin
                   contFlag := CONT_NOT_HANDLED;
 
               stPopad:
-                if code = ST_SINGLE_STEP then
+                if (code = ST_SINGLE_STEP) or (code = ST_WX86_SINGLE_STEP) then
                 begin
-                  if GetCtx(ctx) then
+                  if GetCtx(hCurThread, ctx) then
                   begin
-                    if (ctx.Dr6 and $1) <> 0 then      // DR0 fired: POPAD read the block
+                    if (ctx.Dr6 and $1) <> 0 then
                     begin
                       ctx.Dr0 := 0;
                       ctx.Dr7 := 0;
                       ctx.Dr6 := 0;
-                      ctx.EFlags := ctx.EFlags or TRAP_FLAG;  // step toward OEP
-                      SetCtx(ctx);
+                      ctx.EFlags := ctx.EFlags or TRAP_FLAG;
+                      SetCtx(hCurThread, ctx);
                       FOepSteps := 0;
                       state := stOEP;
                       Log('POPAD reached; stepping to OEP...');
@@ -500,7 +531,7 @@ begin
                     else
                     begin
                       ctx.EFlags := ctx.EFlags and not TRAP_FLAG;
-                      SetCtx(ctx);
+                      SetCtx(hCurThread, ctx);
                     end;
                   end;
                 end
@@ -508,20 +539,20 @@ begin
                   contFlag := CONT_NOT_HANDLED;
 
               stOEP:
-                if code = ST_SINGLE_STEP then
+                if (code = ST_SINGLE_STEP) or (code = ST_WX86_SINGLE_STEP) then
                 begin
-                  if GetCtx(ctx) then
+                  if GetCtx(hCurThread, ctx) then
                   begin
                     rva := Cardinal(ctx.Eip - FBase);
                     sec := SectionOfRVA(rva);
                     if (ctx.Eip >= FBase) and (ctx.Eip < FBase + FSizeOfImage) and
                        (sec >= 0) and (sec <> FStubSec) and
-                       ((FSecChar[sec] and $20000000) <> 0) then    // executable section
+                       ((FSecChar[sec] and $20000000) <> 0) then
                     begin
                       FOEP := ctx.Eip;
                       Log(Format('OEP at $%x (RVA $%x, section %d)', [FOEP, rva, sec]));
                       state := stDump;
-                      running := False;          // stop WITHOUT resuming the payload
+                      running := False;
                     end
                     else
                     begin
@@ -534,18 +565,17 @@ begin
                       else
                       begin
                         ctx.EFlags := ctx.EFlags or TRAP_FLAG;
-                        SetCtx(ctx);
+                        SetCtx(hCurThread, ctx);
                       end;
                     end;
                   end;
                 end
                 else
                   contFlag := CONT_NOT_HANDLED;
-            end; // case state
+            end;
           end;
-      end; // case event
+      end;
 
-      // If we reached the OEP, dump now and leave the target frozen.
       if (not running) and (state = stDump) then
       begin
         if DumpTo(OutputExe) then
@@ -559,14 +589,18 @@ begin
         end
         else if Result.Message = '' then
           Result.Message := 'Dump failed.';
-        Break;                                   // do not ContinueDebugEvent -> payload never runs
+        Break;
       end;
 
       ContinueDebugEvent(de.dwProcessId, de.dwThreadId, contFlag);
-    end; // while
+    end;
   finally
     if FProc <> 0 then
       TerminateProcess(FProc, 0);
+    for kv in threads do
+      if kv.Value <> pi.hThread then
+        CloseHandle(kv.Value);
+    threads.Free;
     if pi.hThread <> 0 then CloseHandle(pi.hThread);
     if pi.hProcess <> 0 then CloseHandle(pi.hProcess);
   end;
