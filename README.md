@@ -75,10 +75,11 @@ It parses the binary, recovers the class model from Delphi's runtime metadata, a
 All tools compile cleanly in both **Delphi / RAD Studio** and **Free Pascal 3.2.2+** (`-Mdelphi`):
 
 ```
-build.bat             rem builds 32-bit (VMTScan, Unpack, OEPScan, Delpheed)
+.uild.bat           rem builds 32-bit (VMTScan, Unpack, OEPScan, Delpheed)
                       rem and 64-bit (VMTScan64, OEPScan64, Delpheed64) into bin\
 ```
 
+- Run it as `.uild.bat` from `cmd` or PowerShell; a bare `build.bat` is not found when the current directory is not searched for commands.
 - If you have RAD Studio Pro/Enterprise/Architect, run `rsvars.bat` then `build.bat` (`dcc32`/`dcc64`).
 - If you have **RAD Studio Community Edition** (which disables `dcc32`/`dcc64` CLI compiling), either open `Delpheed.groupproj` in the RAD Studio IDE and choose **Project -> Build All**, or run `build.bat` with Free Pascal (`fpc`) installed.
 

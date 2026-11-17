@@ -20,10 +20,10 @@ This walks you from building the tools to reading the class list out of packed 3
 Run:
 
 ```
-build.bat
+.uild.bat
 ```
 
-`build.bat` uses `dcc32`/`dcc64` if available and enabled for CLI builds, or Free Pascal (`fpc`) automatically. (Note: RAD Studio Community Edition disables `dcc32`/`dcc64` on the command line - use `Delpheed.groupproj` inside the RAD Studio IDE or Free Pascal via `build.bat`.)
+Use the `.` prefix: on some setups a bare `build.bat` is reported as not recognized. `build.bat` uses `dcc32`/`dcc64` if available and enabled for CLI builds, or Free Pascal (`fpc`) automatically. (Note: RAD Studio Community Edition disables `dcc32`/`dcc64` on the command line - use `Delpheed.groupproj` inside the RAD Studio IDE or Free Pascal via `build.bat`.)
 
 You end up with seven executables in `bin\`:
 
